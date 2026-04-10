@@ -108,6 +108,10 @@ graph TD
       UI[画面設定/ノード定義]
       Mem[内部/PLCメモリ]
     end
+    subgraph ClientFunc[クライアント機能]
+      IFReq[HKC_IFSysBacnet Read/Write要求]
+      IFResp[HKC_IFSysBacnet 応答受信]
+    end
     subgraph Svc[HKC_BacnetService]
       Init[設定読込・ノード生成]
       Mon[メモリ監視]
@@ -128,6 +132,8 @@ graph TD
     UI --> Init --> Cache
     Mem --> Mon --> Upd --> Conv --> Req --> Task --> Client
     Client --> Task --> Req --> Conv --> Cache --> Upd --> Mem
+    IFReq --> Svc --> Req --> Task --> Client
+    Client --> Task --> Req --> Svc --> IFResp
 
     style Svc fill:#cfe2ff,stroke:#1a4d8c
     style Wrap fill:#d9ead3,stroke:#2f6b2f
