@@ -34,6 +34,98 @@ graph TD
   style StackLib fill:#dddddd,stroke:#666,stroke-dasharray:4 3
 ```
 
+### 2.9.2 シーケンス図（サーバ起動）
+
+```mermaid
+sequenceDiagram
+  participant Caller as 上位制御
+  participant Svc as HKC_BacnetService
+  participant Setting as HKC_BacnetServerCommSetting
+  participant Wrap as HKC_BacnetWrapperAPI
+  participant Lib as bacnet-stackライブラリ
+
+  Caller->>Svc: checkDispData(画面設定チェック要求)
+  Svc->>Svc: execCheckDispData(表示設定キャッシュ生成)
+  Svc->>Wrap: loadServerLibrary(使用ライブラリを動的ロード)
+  Wrap->>Lib: QLibrary::load + resolve(関数ポインタ解決)
+
+  Caller->>Svc: reqServerStart(サーバ起動要求)
+  Svc->>Svc: serverStart(起動シーケンス実行)
+  Svc->>Setting: HKC_BacnetServerCommSetting生成(通信設定を反映)
+  Svc->>Svc: initialSetting(初期化処理を集約実行)
+  Svc->>Svc: setInitService(環境変数/静的バインド設定)
+  Svc->>Wrap: Fnc_address_add(静的バインド登録)
+  Svc->>Wrap: Fnc_address_set_device_TTL(静的エントリTTL設定)
+  Svc->>Wrap: Fnc_bacnet_basic_init_callback_set(初期化コールバック登録)
+  Svc->>Wrap: Fnc_bacnet_read_write_value_callback_set(Read/Write応答コールバック登録)
+  Svc->>Wrap: Fnc_bacnet_basic_init + Fnc_bacnet_read_write_init(スタック初期化)
+  Svc->>Wrap: Fnc_Send_WhoIs(起動時探索要求)
+  Wrap->>Lib: bacnet初期化/Who-Is送信
+  Svc->>Svc: timerLoop->start + serverState=SERVER_RUN(周期処理開始)
+  Svc->>Svc: updateSmm(D_SERVER_IS_RUNNING)(状態メモリ更新)
+  Svc-->>Caller: eventOccurred(起動結果通知)
+```
+
+### 2.9.3 シーケンス図（周期更新）
+
+```mermaid
+sequenceDiagram
+  participant Cycle as HKC_SysCycleBacnet
+  participant Svc as HKC_BacnetService
+  participant MM as memoryManager
+  participant Wrap as HKC_BacnetWrapperAPI
+  participant Lib as bacnet-stackライブラリ
+
+  Cycle->>Svc: getMemoryOrder(監視対象メモリ一覧を取得)
+  Cycle->>Cycle: chkMemStat(各メモリ状態を確認)
+  Cycle->>Svc: updateMonitorData(監視データ更新を要求)
+
+  loop 全ノード
+    Svc->>MM: readMemory(getCurrentDataで現在値取得)
+    Svc->>Svc: monitorData更新(取得値を監視キャッシュへ反映)
+  end
+
+  Svc->>Svc: reqUpdateProcess(更新処理をキュー投入)
+  Svc->>Svc: updateProcess(差分判定と反映処理)
+  Svc->>Svc: updateDataへコピー(monitorDataを更新候補へ反映)
+
+  alt デバイス値変更あり
+    Svc->>Svc: writeNodeData(サーバ側キャッシュを更新)
+  end
+
+  alt サーバ値変更あり
+    Svc->>MM: writeMemory(writeDevListへ書込要求)
+    MM-->>Svc: WaitEvent完了(書込完了通知)
+  end
+
+  Svc->>Wrap: Fnc_bacnet_basic_task + Fnc_bacnet_read_write_task(execLoop周期実行)
+  Wrap->>Lib: bacnetタスク実行
+```
+
+### 2.9.4 シーケンス図（外部クライアントによるサーバデータ更新）
+
+```mermaid
+sequenceDiagram
+  participant Client as BACnet Client
+  participant Lib as bacnet-stackライブラリ
+  participant CB as callBackBACnetWritePropertySuccess
+  participant Svc as HKC_BacnetService
+
+  Client->>Lib: WritePropertyRequest(サーバObject/Propertyへ書込み)
+  Lib->>CB: callBackBACnetWritePropertySuccess(書込成功コールバック通知)
+  CB->>Svc: replaceServerCache(objectType, instance, property, data)(サーバキャッシュ更新要求)
+  Svc->>Svc: isNodeExist(対象ノード存在確認)
+
+  alt ノード存在あり
+    Svc->>Svc: getDecodedValue(受信APDUを内部データへ変換)
+    Svc->>Svc: HKD_BacnetNodeInfoConvert::getUpdateValue(更新データへ整形)
+    Svc->>Svc: serverData上書き(サーバ側キャッシュのみ更新)
+    Note over Svc: 実メモリ反映は次回updateProcessで実施
+  else ノード未登録
+    Note over Svc: 対象外ノードとして更新を無視
+  end
+```
+
 ### クラス構成（実装ソース抽出）
 
 | 分類 | クラス/構造体 | 役割 | ファイル |
@@ -103,29 +195,25 @@ sequenceDiagram
   BAC->>BAC: getHandle(接続先テーブルからDeviceIdを取得)
   BAC->>BAC: getSockAddrfromCacheTable(局番→接続先情報を解決)
 
-  alt 接続先情報なし
-    BAC-->>DM: recv8Way(エラー応答を返却)
-  else 接続先情報あり
-    BAC->>BAC: sendWithBacnet(要求コマンドを解析してRead分岐)
-    BAC->>BAC: readProperty(要求パラメータを展開してイベント要求を生成)
-    BAC->>SVC: reqReadProperty(ReadProperty実行を要求)
-    BAC->>BAC: loop.waitEvent(完了通知まで待機)
+  BAC->>BAC: sendWithBacnet(要求コマンドを解析してRead分岐)
+  BAC->>BAC: readProperty(要求パラメータを展開してイベント要求を生成)
+  BAC->>SVC: reqReadProperty(ReadProperty実行を要求)
+  BAC->>BAC: loop.waitEvent(完了通知まで待機)
 
-    SVC->>SVC: execReadProperty(Read処理を実行)
-    SVC->>WRP: Fnc_bacnet_read_property_queue(Read要求をキュー投入)
-    WRP->>STK: ReadProperty要求を実行
-    STK->>DEV: ReadPropertyRequest(オブジェクト/プロパティ読出し)
-    DEV-->>STK: ReadPropertyACK(値/ステータス)
-    STK-->>WRP: 読出し結果を返却
-    WRP-->>SVC: デコード用データを返却
-    SVC->>SVC: chkReadWritePropertyReply(応答内容を解析)
-    SVC->>SVC: getReturnData(戻り値データを保持)
-    SVC-->>BAC: イベント完了通知(結果コードを返却)
+  SVC->>SVC: execReadProperty(Read処理を実行)
+  SVC->>WRP: Fnc_bacnet_read_property_queue(Read要求をキュー投入)
+  WRP->>STK: ReadProperty要求を実行
+  STK->>DEV: ReadPropertyRequest(オブジェクト/プロパティ読出し)
+  DEV-->>STK: ReadPropertyACK(値/ステータス)
+  STK-->>WRP: 読出し結果を返却
+  WRP-->>SVC: デコード用データを返却
+  SVC->>SVC: コールバックで応答内容を解析
+  SVC->>SVC: 戻り値データを保持
+  SVC-->>BAC: イベント完了通知(結果コードを返却)
 
-    BAC->>BAC: convertDetailErrToEthernetErr(詳細エラーを8WAYエラーへ変換)
-    BAC->>BAC: m_aucRxDataへ応答格納(共通応答+読出しデータ)
-    BAC-->>DM: recv8Way(応答データを返却)
-  end
+  BAC->>BAC: convertDetailErrToEthernetErr(詳細エラーを8WAYエラーへ変換)
+  BAC->>BAC: m_aucRxDataへ応答格納(共通応答+読出しデータ)
+  BAC-->>DM: recv8Way(応答データを返却)
 ```
 
 # BACnetサーバ機能
