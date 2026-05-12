@@ -1,9 +1,8 @@
-# BACnetクライアント機能
-
 ## 目次
 
 - [BACnetクライアント機能](#bacnetクライアント機能)
   - [機能概要](#機能概要)
+  - [配列・リスト型プロパティのアクセス制約](#配列リスト型プロパティのアクセス制約)
   - [クラス構成](#クラス構成)
   - [構造図（Mermaid）](#構造図mermaid)
     - [クラス構成図](#クラス構成図)
@@ -44,6 +43,8 @@
     - [共通プロパティ（BIP / MSTP 両方）](#共通プロパティbip--mstp-両方)
     - [BACnet/IP 固有プロパティ（Network_Type = BIP）](#bacnetip-固有プロパティnetwork_type--bip)
     - [BACnet/MS/TP 固有プロパティ（Network_Type = MSTP）](#bacnetmstp-固有プロパティnetwork_type--mstp)
+    - [MS/TP シリアル通信パラメータ（固定値）](#mstp-シリアル通信パラメータ固定値)
+  - [ASHRAE 135 との差異一覧](#ashrae-135-との差異一覧)
 - [BACnetライブラリ管理プロパティ 読み取りマクロ](#bacnetライブラリ管理プロパティ-読み取りマクロ)
   - [機能概要](#機能概要-2)
   - [パラメータ](#パラメータ)
@@ -56,6 +57,8 @@
   - [動作仕様](#動作仕様-1)
   - [対応プロパティ](#対応プロパティ)
   - [NULL 書き込み（Relinquish）の注意事項](#null-書き込みrelinquishの注意事項)
+
+# BACnetクライアント機能
 
 ## 機能概要
 
@@ -72,6 +75,25 @@ BACnetクライアント機能は、HMI画面側からドライバ経由でBACne
 | 呼出先 | HKC_BacnetServiceにReadProperty/WriteProperty要求を依頼 |
 | 範囲外 | HKC_BacnetService以降の内部処理（ライブラリ呼び出し、Who-Is、静的バインド管理など）は本セクションの対象外 |
 
+## 配列・リスト型プロパティのアクセス制約
+
+BACnet規格上、配列型（BACnetARRAY）およびリスト型（BACnetLIST）のプロパティに対する ReadProperty / WriteProperty の `array_index` 指定には以下の制約がある。
+
+### 配列型（BACnetARRAY）
+
+| array_index 値 | 意味 | 備考 |
+|---|---|---|
+| `0` | 配列の要素数を返す | |
+| `1〜n` | 指定インデックスの1要素のみを取得/書き込み | |
+| `BACNET_ARRAY_ALL`（`UINT32_MAX`） | 全要素を一括取得/書き込み | |
+
+モニタッチのクライアント機能では、8WAY通信I/Fを介してユーザーがプロジェクト作成時にリード/ライトするバイト数（デバイスメモリ割り当て）を固定する設計のため、`BACNET_ARRAY_ALL` による一括アクセスはできない。**配列型プロパティへのアクセスは1要素ずつのインデックス指定となる。**
+
+### リスト型（BACnetLIST）
+
+BACnetLIST はインデックスという概念が型仕様に存在せず、ReadProperty / WriteProperty では常に全体（`BACNET_ARRAY_ALL` 相当 = `array_index` 省略）での一括アクセスのみが規格上定義されている。要素単位の追加・削除は `AddListElement` / `RemoveListElement` サービスを使用する。
+
+モニタッチのクライアント機能の設計上、`BACNET_ARRAY_ALL` による一括アクセスに対応しておらず、かつ応答サイズが相手デバイスの状態によって可変となるため、**クライアント機能としてのリスト型プロパティへのアクセスは通常の8WAY通信経由では対応できない。対応する場合は専用マクロによるリード/ライトが必要となる想定**（→ [BACnetライブラリ管理プロパティ 読み取りマクロ](#bacnetライブラリ管理プロパティ-読み取りマクロ) および [BACnet Priority Write / Relinquish 書き込みマクロ](#bacnet-priority-write--relinquish-書き込みマクロ) の T.B.D. 参照）。
 
 ## クラス構成
 
@@ -427,7 +449,7 @@ BIBBs（BACnet Interoperability Building Blocks）は ASHRAE 135 Annex K で定�
 |---|---|---|---|---|---|---|
 | データ共有 | DS-RP-A | ReadProperty | 他デバイスのプロパティ値を読み取る（要求送信） | ○ | — | |
 | データ共有 | DS-RP-B | ReadProperty | プロパティ読み取り要求を受信して応答する | — | ○ | |
-| データ共有 | DS-RPM-A | ReadPropertyMultiple | 複数プロパティを一括読み取りする（要求送信） | × | — | |
+| データ共有 | DS-RPM-A | ReadPropertyMultiple | 複数プロパティを一括読み取りする（要求送信） | ○ | — | s_rpm.c に Send_Read_Property_Multiple_Request() あり。固定長プロパティ（Real, Unsigned, Enumerated 等）を RPM で一括読み取り。CharacterString 等の可変長プロパティは DS-RP-A（RP）で個別読み取りとする設計は ASHRAE 135 Section 15.7 上問題なし（クライアントがどのプロパティを RPM で送るかの制約は規定なし） |
 | データ共有 | DS-RPM-B | ReadPropertyMultiple | 複数プロパティ読み取り要求を受信して応答する | — | ○ | |
 | データ共有 | DS-WP-A | WriteProperty | 他デバイスのプロパティ値を書き込む（要求送信） | ○ | — | |
 | データ共有 | DS-WP-B | WriteProperty | プロパティ書き込み要求を受信して処理する | — | ○ | |
@@ -439,40 +461,40 @@ BIBBs（BACnet Interoperability Building Blocks）は ASHRAE 135 Annex K で定�
 | データ共有 | DS-COVP-B | SubscribeCOVProperty / COVNotification | 特定プロパティのCOV購読を受け付け、変化時に通知を送信する | — | × | `h_cov.c` が `Present_Value` の監視のみハードコードされており任意プロパティの監視が未実装（FIXME コメントあり）。ハンドラ登録だけでは対応不可 |
 | データ共有 | DS-WG-A | WriteGroup | グループへのプロパティ一括書き込みを送信する | × | — | WPとは別の専用I/Fが必要。Channelオブジェクト未対応のため非対応 |
 | データ共有 | DS-WG-B | WriteGroup | グループへの一括書き込み要求を処理する | — | × | ハンドラ登録・Channelオブジェクトともに未実装 |
-| アラーム・イベント | AE-N-I-A | ConfirmedEventNotification / UnconfirmedEventNotification | Intrinsic Reporting のアラーム通知を送信する | — | T.B.D | AI/BI等のオブジェクトのアラーム条件に基づく |
-| アラーム・イベント | AE-N-I-B | ConfirmedEventNotification / UnconfirmedEventNotification | Intrinsic Reporting のアラーム通知を受信・処理する | T.B.D | — | |
-| アラーム・イベント | AE-N-EX-A | ConfirmedEventNotification / UnconfirmedEventNotification | Algorithmic Change Reporting のアラーム通知を送信する | — | T.B.D | EventEnrollmentオブジェクトを使用 |
-| アラーム・イベント | AE-N-EX-B | ConfirmedEventNotification / UnconfirmedEventNotification | Algorithmic Change Reporting のアラーム通知を受信・処理する | T.B.D | — | |
-| アラーム・イベント | AE-ACK-A | AcknowledgeAlarm | アラームの確認応答要求を送信する | T.B.D | — | |
-| アラーム・イベント | AE-ACK-B | AcknowledgeAlarm | アラームの確認応答要求を受信・処理する | — | T.B.D | |
-| アラーム・イベント | AE-ASUM-A | GetAlarmSummary | アラームサマリーを取得する（要求送信） | T.B.D | — | 135-2020 では非推奨傾向、AE-ESUM を推奨 |
-| アラーム・イベント | AE-ASUM-B | GetAlarmSummary | アラームサマリー要求を受信して応答する | — | T.B.D | |
-| アラーム・イベント | AE-ESUM-A | GetEventInformation | イベント情報一覧を取得する（要求送信） | T.B.D | — | |
-| アラーム・イベント | AE-ESUM-B | GetEventInformation | イベント情報取得要求を受信して応答する | — | T.B.D | |
-| アラーム・イベント | AE-LS-A | LifeSafetyOperation | ライフセーフティ操作要求を送信する | T.B.D | — | |
-| アラーム・イベント | AE-LS-B | LifeSafetyOperation | ライフセーフティ操作要求を受信・処理する | — | T.B.D | |
-| スケジューリング | SCHED-A | ReadProperty / WriteProperty | Schedule オブジェクトを参照・設定する（要求送信） | T.B.D | — | |
-| スケジューリング | SCHED-B | — | Schedule オブジェクトとして動作し、設定時刻に対象プロパティへ値を書き込む | — | T.B.D | Scheduleオブジェクトが必要 |
-| トレンド | T-VMT-A | ReadRange / WriteProperty | TrendLog の閲覧・設定を行う（要求送信） | T.B.D | — | |
-| トレンド | T-VMT-B | ReadRange / WriteProperty | TrendLog の閲覧・設定要求を受信して応答する | — | T.B.D | TrendLogオブジェクトが必要 |
-| トレンド | T-ATR-A | ReadRange | TrendLog データを自動取得する | T.B.D | — | |
-| トレンド | T-ATR-B | ReadRange | TrendLog データ取得要求を受信して応答する | — | T.B.D | |
+| アラーム・イベント | AE-N-I-A | ConfirmedEventNotification / UnconfirmedEventNotification | Intrinsic Reporting のアラーム通知を受信・処理する | × | — | Confirmed/Unconfirmed EventNotification の受信ハンドラが未実装。モニタッチがアラーム通知受信クライアントとして動作する場合は実装が必要 |
+| アラーム・イベント | AE-N-I-B | ConfirmedEventNotification / UnconfirmedEventNotification | Intrinsic Reporting のアラーム通知を送信する | — | × | `INTRINSIC_REPORTING` マクロが未定義のため無効。AI/BI 等のオブジェクトにアラーム機能（High_Limit/Low_Limit 等）を付加する場合は、本マクロの有効化と Notification Class オブジェクト追加が必要 |
+| アラーム・イベント | AE-N-EX-A | ConfirmedEventNotification / UnconfirmedEventNotification | Algorithmic Change Reporting のアラーム通知を受信・処理する | × | — | Confirmed/Unconfirmed EventNotification の受信ハンドラが未実装。モニタッチがアラーム通知受信クライアントとして動作する場合は実装が必要 |
+| アラーム・イベント | AE-N-EX-B | ConfirmedEventNotification / UnconfirmedEventNotification | Algorithmic Change Reporting のアラーム通知を送信する | — | × | EventEnrollment オブジェクト未実装。`bacnet_basic_init()` 未登録。EventEnrollment オブジェクト Type を対応する場合は本 BIBB の実装が必要 |
+| アラーム・イベント | AE-ACK-A | AcknowledgeAlarm | アラームの確認応答要求を送信する | × | — | 他デバイスへの AcknowledgeAlarm 送信ユースケースなし |
+| アラーム・イベント | AE-ACK-B | AcknowledgeAlarm | アラームの確認応答要求を受信・処理する | — | × | `bacnet_basic_init()` で未登録。`handler_alarm_ack_set()` によるオブジェクト種別ごとの登録が必要。アラームイベント機能を対応する場合は本 BIBB の実装が必要 |
+| アラーム・イベント | AE-ASUM-A | GetAlarmSummary | アラームサマリーを取得する（要求送信） | × | — | 135-2020 では非推奨（AE-ESUM を推奨）。他デバイスへの送信ユースケースなし |
+| アラーム・イベント | AE-ASUM-B | GetAlarmSummary | アラームサマリー要求を受信して応答する | — | × | `bacnet_basic_init()` で未登録。`handler_get_alarm_summary_set()` によるオブジェクト種別ごとの登録が必要。アラームイベント機能を対応する場合は本 BIBB の実装が必要 |
+| アラーム・イベント | AE-ESUM-A | GetEventInformation | イベント情報一覧を取得する（要求送信） | × | — | 他デバイスへの GetEventInformation 送信ユースケースなし |
+| アラーム・イベント | AE-ESUM-B | GetEventInformation | イベント情報取得要求を受信して応答する | — | × | `bacnet_basic_init()` で未登録。アラームイベント機能を対応する場合は本 BIBB の実装が必要 |
+| アラーム・イベント | AE-LS-A | LifeSafetyOperation | ライフセーフティ操作要求を送信する | × | — | 他デバイスへの LifeSafetyOperation 送信ユースケースなし |
+| アラーム・イベント | AE-LS-B | LifeSafetyOperation | ライフセーフティ操作要求を受信・処理する | — | × | `bacnet_basic_init()` で未登録。LifeSafetyPoint/Zone オブジェクト Type を対応する場合は本 BIBB の実装が必要 |
+| スケジューリング | SCHED-A | ReadProperty / WriteProperty | Schedule オブジェクトを参照・設定する（要求送信） | × | — | 他デバイスの Schedule を参照するユースケースなし |
+| スケジューリング | SCHED-B | — | Schedule オブジェクトとして動作し、設定時刻に対象プロパティへ値を書き込む | — | × | Schedule オブジェクト未使用。`bacnet_basic_init()` 未登録。Schedule オブジェクト Type を対応する場合は本 BIBB の実装が必要 |
+| トレンド | T-VMT-A | ReadRange / WriteProperty | TrendLog の閲覧・設定を行う（要求送信） | × | — | 他デバイスの TrendLog を参照するユースケースなし |
+| トレンド | T-VMT-B | ReadRange / WriteProperty | TrendLog の閲覧・設定要求を受信して応答する | — | × | TrendLog オブジェクト未使用。`bacnet_basic_init()` で ReadRange ハンドラが未登録。TrendLog オブジェクト Type を対応する場合は本 BIBB の実装が必要 |
+| トレンド | T-ATR-A | ReadRange | TrendLog データを自動取得する | × | — | 他デバイスの TrendLog を自動取得するユースケースなし |
+| トレンド | T-ATR-B | ReadRange | TrendLog データ取得要求を受信して応答する | — | × | TrendLog オブジェクト未使用。`bacnet_basic_init()` で ReadRange ハンドラが未登録。TrendLog オブジェクト Type を対応する場合は本 BIBB の実装が必要 |
 | デバイス・ネットワーク管理 | DM-DDB-A | Who-Is / I-Am | Who-Is を送信してデバイスを検索し、I-Am を受信する | × | — | 静的バインドで指定するため非対応 |
 | デバイス・ネットワーク管理 | DM-DDB-B | Who-Is / I-Am | Who-Is を受信し、I-Am で自デバイス情報を応答する | — | ○ | bacnet-stack にて対応 |
 | デバイス・ネットワーク管理 | DM-DOB-A | Who-Has / I-Have | Who-Has を送信してオブジェクトを検索し、I-Have を受信する | × | — | 静的バインドで指定するため非対応 |
 | デバイス・ネットワーク管理 | DM-DOB-B | Who-Has / I-Have | Who-Has を受信し、I-Have で応答する | — | ○ | bacnet-stack にて対応 |
 | デバイス・ネットワーク管理 | DM-DCC-A | DeviceCommunicationControl | 他デバイスの通信を一時停止・再開する（要求送信） | × | — | 専用I/F未実装 |
 | デバイス・ネットワーク管理 | DM-DCC-B | DeviceCommunicationControl | 通信制御要求を受信・処理する | — | ○ | bacnet_basic_init()にて自動登録済み。DISABLE受信時はモニタッチ自身のRP/WP送信（クライアント機能）も停止し、停止中の要求はAPDUタイムアウト後にTIMEOUTエラーとなる |
-| デバイス・ネットワーク管理 | DM-PT-A | PrivateTransfer | ベンダー固有のPrivateTransfer 要求を送信する | T.B.D | — | |
-| デバイス・ネットワーク管理 | DM-PT-B | PrivateTransfer | PrivateTransfer 要求を受信・処理する | — | T.B.D | |
-| デバイス・ネットワーク管理 | DM-TM-A | TextMessage | テキストメッセージを送信する | T.B.D | — | 135-2020 では非推奨傾向 |
-| デバイス・ネットワーク管理 | DM-TM-B | TextMessage | テキストメッセージを受信・表示する | — | T.B.D | |
-| デバイス・ネットワーク管理 | DM-RD-A | ReinitializeDevice | 他デバイスの再初期化要求を送信する | T.B.D | — | |
-| デバイス・ネットワーク管理 | DM-RD-B | ReinitializeDevice | 再初期化要求を受信・処理する | — | T.B.D | warm-start / activate-changes 等の処理 |
-| デバイス・ネットワーク管理 | DM-TS-A | TimeSynchronization | 時刻同期メッセージを送信する | T.B.D | — | |
-| デバイス・ネットワーク管理 | DM-TS-B | TimeSynchronization | 時刻同期メッセージを受信してシステム時刻を更新する | — | T.B.D | |
-| デバイス・ネットワーク管理 | DM-UTC-A | UTCTimeSynchronization | UTC時刻同期メッセージを送信する | T.B.D | — | |
-| デバイス・ネットワーク管理 | DM-UTC-B | UTCTimeSynchronization | UTC時刻同期メッセージを受信してシステム時刻を更新する | — | T.B.D | |
+| デバイス・ネットワーク管理 | DM-PT-A | PrivateTransfer | ベンダー固有のPrivateTransfer 要求を送信する | × | — | bacnet-stack にエンコーダはあるが、ベンダー固有コンテンツの定義が必要で活用ユースケースなし |
+| デバイス・ネットワーク管理 | DM-PT-B | PrivateTransfer | PrivateTransfer 要求を受信・処理する | — | × | Confirmed PT ハンドラ未実装。Unconfirmed PT ハンドラは存在するが `bacnet_basic_init()` で未登録 |
+| デバイス・ネットワーク管理 | DM-TM-A | TextMessage | テキストメッセージを送信する | × | — | bacnet-stack に送信関数・エンコーダが未実装 |
+| デバイス・ネットワーク管理 | DM-TM-B | TextMessage | テキストメッセージを受信・表示する | — | × | bacnet-stack にハンドラが未実装 |
+| デバイス・ネットワーク管理 | DM-RD-A | ReinitializeDevice | 他デバイスの再初期化要求を送信する | × | — | bacnet-stack に `Send_Reinitialize_Device_Request()` あり。他デバイスへの送信ユースケースが存在しないため非対応 |
+| デバイス・ネットワーク管理 | DM-RD-B | ReinitializeDevice | 再初期化要求を受信・処理する | — | △ | `bacnet_basic_init()` 内で `handler_reinitialize_device()` が自動登録される。ACTIVATE_CHANGES は自動処理済み。COLDSTART/WARMSTART は SimpleACK 返却のみで実際の再起動は未実装 |
+| デバイス・ネットワーク管理 | DM-TS-A | TimeSynchronization | 時刻同期メッセージを送信する | × | — | bacnet-stack に `Send_TimeSync()` 等の送信関数あり。送信機能（`BACNET_TIME_MASTER`）は現状非対応 |
+| デバイス・ネットワーク管理 | DM-TS-B | TimeSynchronization | 時刻同期メッセージを受信してシステム時刻を更新する | — | × | bacnet-stack に `handler_timesync()` あり。受信時のOS時刻反映は現状非対応 |
+| デバイス・ネットワーク管理 | DM-UTC-A | UTCTimeSynchronization | UTC時刻同期メッセージを送信する | × | — | bacnet-stack に `Send_TimeSyncUTC()` 等の送信関数あり。送信機能（`BACNET_TIME_MASTER`）は現状非対応 |
+| デバイス・ネットワーク管理 | DM-UTC-B | UTCTimeSynchronization | UTC時刻同期メッセージを受信してシステム時刻を更新する | — | × | bacnet-stack に `handler_timesync_utc()` あり。受信時のOS時刻反映は現状非対応 |
 | デバイス・ネットワーク管理 | DM-NM-A | ネットワーク管理系メッセージ | ルータ・ネットワーク管理メッセージを送信する | × | × | ルータ機能が必要なため対象外 |
 | デバイス・ネットワーク管理 | DM-NM-B | ネットワーク管理系メッセージ | ルータ・ネットワーク管理メッセージを処理する | × | × | ルータ機能が必要なため対象外 |
 | デバイス・ネットワーク管理 | DM-AUDR-A | AuditNotification | 監査ログ通知を送信する | — | × | 135-2020 新規追加機能。bacnet-stack 未実装 |
@@ -482,22 +504,22 @@ BIBBs（BACnet Interoperability Building Blocks）は ASHRAE 135 Annex K で定�
 
 ASHRAE 135 Annex J / Clause 9 に基づくデータリンク層の対応状況です。
 
-| 項目 | 内容 | 対応 | 備考 |
-|---|---|---|---|
-| BACnet/IP（Annex J） | UDP/IP によるBACnet通信 | ○ | |
-| BACnet/IP BBMD機能 | Broadcast Management Device として動作 | × | モニタッチ自身がBBMDとして動作し他デバイスのFD登録を受け付ける機能。別サブネット上のデバイスへのアクセスは静的バインドまたはFD登録（Foreign Device）で対応するため不要 |
-| BACnet/IP Foreign Device登録（FD） | BBMDへのForeign Device登録 | ○ | `FD_BBMD_Address` / `FD_Subscription_Lifetime` で設定 |
-| BACnet/IP NAT Traversal | NATルータ越えの通信 | × | |
-| BACnet/IPv6（Annex U） | IPv6 によるBACnet通信 | × | |
-| BACnet/IPv6 BBMD機能 | IPv6環境でのBBMD機能 | × | |
-| MS/TP（Clause 9）Master | RS-485 マルチマスタ通信 | ○ | |
-| MS/TP（Clause 9）Slave | RS-485 スレーブ通信 | ○ | `dlmstp_slave_mode_enabled_set(true)` でスレーブノードのステートマシンを有効化 |
-| ARCNET | ARCNET 通信 | × | |
-| Ethernet（ISO 8802-3） | ダイレクトEthernet（Clause 7） | × | |
-| LonTalk（ISO/IEC 14908.1） | LonWorks 通信（Clause 11） | × | |
-| BACnet Secure Connect（Annex AB） | TLS 1.3 によるセキュア通信 | × | |
-| Point-To-Point EIA-232（Clause 10） | シリアルポイント間通信 | × | |
-| BACnet/ZigBee（Annex O） | ZigBee 通信 | × | |
+| プロトコル | 機能 | 内容 | 対応 | 備考 |
+|---|---|---|---|---|
+| BACnet/IP（Annex J） | 基本通信 | UDP/IP によるBACnet通信 | ○ | |
+| | BBMD機能 | Broadcast Management Device として動作 | × | モニタッチ自身がBBMDとして動作し他デバイスのFD登録を受け付ける機能。別サブネット上のデバイスへのアクセスは静的バインドまたはFD登録（Foreign Device）で対応するため不要 |
+| | Foreign Device登録（FD） | BBMDへのForeign Device登録 | ○ | `FD_BBMD_Address` / `FD_Subscription_Lifetime` で設定 |
+| | NAT Traversal | NATルータ越えの通信 | × | |
+| BACnet/IPv6（Annex U） | 基本通信 | IPv6 によるBACnet通信 | × | |
+| | BBMD機能 | IPv6環境でのBBMD機能 | × | |
+| MS/TP（Clause 9） | Master | RS-485 マルチマスタ通信 | ○ | トークンパッシングリングに参加し、トークン保持中にRP/WP要求を送信できる（クライアント機能あり）。要求の受信・応答（サーバ機能）も可能 |
+| | Slave | RS-485 スレーブ通信 | ○ | トークンパッシングリングに参加せず、マスタからの要求に応答するのみ（サーバ機能のみ）。クライアント機能なし。`dlmstp_slave_mode_enabled_set(true)` でスレーブノードのステートマシンを有効化 |
+| ARCNET | — | ARCNET 通信 | × | |
+| Ethernet（ISO 8802-3） | — | ダイレクトEthernet（Clause 7） | × | |
+| LonTalk（ISO/IEC 14908.1） | — | LonWorks 通信（Clause 11） | × | |
+| BACnet Secure Connect（Annex AB） | — | TLS 1.3 によるセキュア通信 | × | |
+| Point-To-Point EIA-232（Clause 10） | — | シリアルポイント間通信 | × | |
+| BACnet/ZigBee（Annex O） | — | ZigBee 通信 | × | |
 
 **MS/TP 対応データレート：**
 
@@ -785,20 +807,20 @@ BIT_STRING プロパティのキャッシュバイト数はユーザーが設定
 
 ASHRAE 135-2024 Table 12-2 に基づくモニタッチ対応プロパティ。
 
-| プロパティ名 | Property Identifier | ASHRAE区分 | アクセス | BACnetデータ型 | `BACNET_APPLICATION_TAG` | サーバ更新区分 |
-|---|---|---|---|---|---|---|
-| Object_Identifier | 75 | Required | R | BACnetObjectIdentifier | `BACNET_APPLICATION_TAG_OBJECT_ID` | ライブラリ固定 |
-| Object_Name | 77 | Required | R | CharacterString | `BACNET_APPLICATION_TAG_CHARACTER_STRING` | 初回設定（ユーザー値） |
-| Object_Type | 79 | Required | R | BACnetObjectType (ENUMERATED) | `BACNET_APPLICATION_TAG_ENUMERATED` | ライブラリ固定 |
-| Present_Value | 85 | Required | R | REAL | `BACNET_APPLICATION_TAG_REAL` | 毎スキャン書込 |
-| Description | 28 | Optional | R | CharacterString | `BACNET_APPLICATION_TAG_CHARACTER_STRING` | 初回設定（ユーザー値） |
-| Status_Flags | 111 | Required | R | BACnetStatusFlags (BIT STRING) | `BACNET_APPLICATION_TAG_BIT_STRING` | 毎スキャン監視 |
-| Event_State | 36 | Required | R | BACnetEventState (ENUMERATED) | `BACNET_APPLICATION_TAG_ENUMERATED` | 毎スキャン監視 |
-| Reliability | 103 | Optional | R | BACnetReliability (ENUMERATED) | `BACNET_APPLICATION_TAG_ENUMERATED` | アプリ内部更新 |
-| Out_Of_Service | 81 | Required | RW | BOOLEAN | `BACNET_APPLICATION_TAG_BOOLEAN` | 毎スキャン書込 |
-| Units | 117 | Required | RW | BACnetEngineeringUnits (ENUMERATED) | `BACNET_APPLICATION_TAG_ENUMERATED` | 初回設定（WP更新あり） |
-| COV_Increment | 22 | Optional | RW | REAL | `BACNET_APPLICATION_TAG_REAL` | 初回設定（WP更新あり） |
-| Property_List | 371 | Required | R | BACnetARRAY[N] of BACnetPropertyIdentifier (ENUMERATED) | `BACNET_APPLICATION_TAG_ENUMERATED` | ライブラリ固定 |
+| プロパティ名 | 概要 | Property Identifier | ASHRAE区分 | アクセス | BACnetデータ型 | `BACNET_APPLICATION_TAG` | サーバ更新区分 |
+|---|---|---|---|---|---|---|---|
+| Object_Identifier | このオブジェクトを識別する数値コード。デバイス内で一意 | 75 | Required | R | BACnetObjectIdentifier | `BACNET_APPLICATION_TAG_OBJECT_ID` | ライブラリ固定 |
+| Object_Name | デバイス内で一意のオブジェクト名文字列（最低1文字） | 77 | Required | R | CharacterString | `BACNET_APPLICATION_TAG_CHARACTER_STRING` | 初回設定（ユーザー値） |
+| Object_Type | オブジェクト種別を示す読み取り専用プロパティ（ANALOG_INPUT固定） | 79 | Required | R | BACnetObjectType (ENUMERATED) | `BACNET_APPLICATION_TAG_ENUMERATED` | ライブラリ固定 |
+| Present_Value | アナログ入力の現在値（工学単位）。Out_Of_Service=TRUEの場合のみ書き込み可 | 85 | Required | R | REAL | `BACNET_APPLICATION_TAG_REAL` | 毎スキャン書込 |
+| Description | 内容が制限されない任意の印刷可能文字列 | 28 | Optional | R | CharacterString | `BACNET_APPLICATION_TAG_CHARACTER_STRING` | 初回設定（ユーザー値） |
+| Status_Flags | オブジェクトの健全性を示す4ビットフラグ（IN_ALARM / FAULT / OVERRIDDEN / OUT_OF_SERVICE） | 111 | Required | R | BACnetStatusFlags (BIT STRING) | `BACNET_APPLICATION_TAG_BIT_STRING` | 毎スキャン監視 |
+| Event_State | 現在のイベント状態。イベント報告非対応時はNORMAL | 36 | Required | R | BACnetEventState (ENUMERATED) | `BACNET_APPLICATION_TAG_ENUMERATED` | 毎スキャン監視 |
+| Reliability | Present_Valueまたは物理入力が信頼できるかどうかの表示 | 103 | Optional | R | BACnetReliability (ENUMERATED) | `BACNET_APPLICATION_TAG_ENUMERATED` | アプリ内部更新 |
+| Out_Of_Service | TRUEのとき物理入力とPresent_Valueが切り離される | 81 | Required | RW | BOOLEAN | `BACNET_APPLICATION_TAG_BOOLEAN` | 毎スキャン書込 |
+| Units | Present_Valueの工学単位 | 117 | Required | RW | BACnetEngineeringUnits (ENUMERATED) | `BACNET_APPLICATION_TAG_ENUMERATED` | 初回設定（WP更新あり） |
+| COV_Increment | COV通知を発行するPresent_Valueの最小変化量 | 22 | Optional | RW | REAL | `BACNET_APPLICATION_TAG_REAL` | 初回設定（WP更新あり） |
+| Property_List | このオブジェクトに存在するプロパティ識別子の配列 | 371 | Required | R | BACnetARRAY[N] of BACnetPropertyIdentifier (ENUMERATED) | `BACNET_APPLICATION_TAG_ENUMERATED` | ライブラリ固定 |
 
 > `Present_Value` は `Out_Of_Service = TRUE` の場合のみ書き込み可。
 
@@ -810,25 +832,25 @@ ASHRAE 135-2024 Table 12-2 に基づくモニタッチ対応プロパティ。
 
 ASHRAE 135-2024 Table 12-4 に基づくモニタッチ対応プロパティ。
 
-| プロパティ名 | Property Identifier | ASHRAE区分 | アクセス | BACnetデータ型 | `BACNET_APPLICATION_TAG` | サーバ更新区分 |
-|---|---|---|---|---|---|---|
-| Object_Identifier | 75 | Required | R | BACnetObjectIdentifier | `BACNET_APPLICATION_TAG_OBJECT_ID` | ライブラリ固定 |
-| Object_Name | 77 | Required | R | CharacterString | `BACNET_APPLICATION_TAG_CHARACTER_STRING` | 初回設定（ユーザー値） |
-| Object_Type | 79 | Required | R | BACnetObjectType (ENUMERATED) | `BACNET_APPLICATION_TAG_ENUMERATED` | ライブラリ固定 |
-| Present_Value | 85 | Required | RW | REAL | `BACNET_APPLICATION_TAG_REAL` | 毎スキャン書込 |
-| Description | 28 | Optional | R | CharacterString | `BACNET_APPLICATION_TAG_CHARACTER_STRING` | 初回設定（ユーザー値） |
-| Status_Flags | 111 | Required | R | BACnetStatusFlags (BIT STRING) | `BACNET_APPLICATION_TAG_BIT_STRING` | 毎スキャン監視 |
-| Event_State | 36 | Required | R | BACnetEventState (ENUMERATED) | `BACNET_APPLICATION_TAG_ENUMERATED` | 毎スキャン監視 |
-| Reliability | 103 | Optional | R | BACnetReliability (ENUMERATED) | `BACNET_APPLICATION_TAG_ENUMERATED` | アプリ内部更新 |
-| Out_Of_Service | 81 | Required | RW | BOOLEAN | `BACNET_APPLICATION_TAG_BOOLEAN` | 毎スキャン書込 |
-| Units | 117 | Required | RW | BACnetEngineeringUnits (ENUMERATED) | `BACNET_APPLICATION_TAG_ENUMERATED` | 初回設定（WP更新あり） |
-| Min_Pres_Value | 69 | Optional | RW | REAL | `BACNET_APPLICATION_TAG_REAL` | 初回設定（WP更新あり） |
-| Max_Pres_Value | 65 | Optional | RW | REAL | `BACNET_APPLICATION_TAG_REAL` | 初回設定（WP更新あり） |
-| COV_Increment | 22 | Optional | RW | REAL | `BACNET_APPLICATION_TAG_REAL` | 初回設定（WP更新あり） |
-| Priority_Array | 87 | Required | R | BACnetPriorityArray (16要素配列) | `BACNET_APPLICATION_TAG_NULL` / `BACNET_APPLICATION_TAG_REAL` | ライブラリ管理 |
-| Relinquish_Default | 104 | Required | R | REAL | `BACNET_APPLICATION_TAG_REAL` | 初回設定（ユーザー値） |
-| Current_Command_Priority | 431 | Required | R | BACnetOptionalUnsigned (NULL(0で表現) または Unsigned 1〜16) | `BACNET_APPLICATION_TAG_UNSIGNED_INT` | 毎スキャン監視 |
-| Property_List | 371 | Required | R | BACnetARRAY[N] of BACnetPropertyIdentifier (ENUMERATED) | `BACNET_APPLICATION_TAG_ENUMERATED` | ライブラリ固定 |
+| プロパティ名 | 概要 | Property Identifier | ASHRAE区分 | アクセス | BACnetデータ型 | `BACNET_APPLICATION_TAG` | サーバ更新区分 |
+|---|---|---|---|---|---|---|---|
+| Object_Identifier | このオブジェクトを識別する数値コード。デバイス内で一意 | 75 | Required | R | BACnetObjectIdentifier | `BACNET_APPLICATION_TAG_OBJECT_ID` | ライブラリ固定 |
+| Object_Name | デバイス内で一意のオブジェクト名文字列（最低1文字） | 77 | Required | R | CharacterString | `BACNET_APPLICATION_TAG_CHARACTER_STRING` | 初回設定（ユーザー値） |
+| Object_Type | オブジェクト種別を示す読み取り専用プロパティ（ANALOG_OUTPUT固定） | 79 | Required | R | BACnetObjectType (ENUMERATED) | `BACNET_APPLICATION_TAG_ENUMERATED` | ライブラリ固定 |
+| Present_Value | アナログ出力の現在値（工学単位）。BACnetコマンド優先制御に従う | 85 | Required | RW | REAL | `BACNET_APPLICATION_TAG_REAL` | 毎スキャン書込 |
+| Description | 内容が制限されない任意の印刷可能文字列 | 28 | Optional | R | CharacterString | `BACNET_APPLICATION_TAG_CHARACTER_STRING` | 初回設定（ユーザー値） |
+| Status_Flags | オブジェクトの健全性を示す4ビットフラグ（IN_ALARM / FAULT / OVERRIDDEN / OUT_OF_SERVICE） | 111 | Required | R | BACnetStatusFlags (BIT STRING) | `BACNET_APPLICATION_TAG_BIT_STRING` | 毎スキャン監視 |
+| Event_State | 現在のイベント状態。イベント報告非対応時はNORMAL | 36 | Required | R | BACnetEventState (ENUMERATED) | `BACNET_APPLICATION_TAG_ENUMERATED` | 毎スキャン監視 |
+| Reliability | Present_Valueまたは物理出力の信頼性の表示 | 103 | Optional | R | BACnetReliability (ENUMERATED) | `BACNET_APPLICATION_TAG_ENUMERATED` | アプリ内部更新 |
+| Out_Of_Service | TRUEのとき物理出力とPresent_Valueが切り離される | 81 | Required | RW | BOOLEAN | `BACNET_APPLICATION_TAG_BOOLEAN` | 毎スキャン書込 |
+| Units | Present_Valueの工学単位 | 117 | Required | RW | BACnetEngineeringUnits (ENUMERATED) | `BACNET_APPLICATION_TAG_ENUMERATED` | 初回設定（WP更新あり） |
+| Min_Pres_Value | アナログ出力の最小出力値（工学単位） | 69 | Optional | RW | REAL | `BACNET_APPLICATION_TAG_REAL` | 初回設定（WP更新あり） |
+| Max_Pres_Value | アナログ出力の最大出力値（工学単位） | 65 | Optional | RW | REAL | `BACNET_APPLICATION_TAG_REAL` | 初回設定（WP更新あり） |
+| COV_Increment | COV通知を発行するPresent_Valueの最小変化量 | 22 | Optional | RW | REAL | `BACNET_APPLICATION_TAG_REAL` | 初回設定（WP更新あり） |
+| Priority_Array | 読み取り専用。現在有効な優先制御コマンドの16段階配列 | 87 | Required | R | BACnetPriorityArray (16要素配列) | `BACNET_APPLICATION_TAG_NULL` / `BACNET_APPLICATION_TAG_REAL` | ライブラリ管理 |
+| Relinquish_Default | Priority_Arrayがすべてnullのときに使用されるデフォルト値 | 104 | Required | R | REAL | `BACNET_APPLICATION_TAG_REAL` | 初回設定（ユーザー値） |
+| Current_Command_Priority | 読み取り専用。現在有効な優先度インデックス（1〜16、nullはRelinquish_Default使用中） | 431 | Required | R | BACnetOptionalUnsigned (NULL(0で表現) または Unsigned 1〜16) | `BACNET_APPLICATION_TAG_UNSIGNED_INT` | 毎スキャン監視 |
+| Property_List | このオブジェクトに存在するプロパティ識別子の配列 | 371 | Required | R | BACnetARRAY[N] of BACnetPropertyIdentifier (ENUMERATED) | `BACNET_APPLICATION_TAG_ENUMERATED` | ライブラリ固定 |
 
 > **Present_Value 書き込み Priority 設計方針**
 > - Priority はインスタンス単位で個別に設定可能とする。設定値は固定となり、動的変更は行わない
@@ -842,21 +864,21 @@ ASHRAE 135-2024 Table 12-4 に基づくモニタッチ対応プロパティ。
 
 ASHRAE 135-2024 Table 12-6 に基づくモニタッチ対応プロパティ。
 
-| プロパティ名 | Property Identifier | ASHRAE区分 | アクセス | BACnetデータ型 | `BACNET_APPLICATION_TAG` | サーバ更新区分 |
-|---|---|---|---|---|---|---|
-| Object_Identifier | 75 | Required | R | BACnetObjectIdentifier | `BACNET_APPLICATION_TAG_OBJECT_ID` | ライブラリ固定 |
-| Object_Name | 77 | Required | R | CharacterString | `BACNET_APPLICATION_TAG_CHARACTER_STRING` | 初回設定（ユーザー値） |
-| Object_Type | 79 | Required | R | BACnetObjectType (ENUMERATED) | `BACNET_APPLICATION_TAG_ENUMERATED` | ライブラリ固定 |
-| Present_Value | 85 | Required | R | BACnetBinaryPV (ENUMERATED: INACTIVE=0 / ACTIVE=1) | `BACNET_APPLICATION_TAG_ENUMERATED` | 毎スキャン書込 |
-| Description | 28 | Optional | R | CharacterString | `BACNET_APPLICATION_TAG_CHARACTER_STRING` | 初回設定（ユーザー値） |
-| Status_Flags | 111 | Required | R | BACnetStatusFlags (BIT STRING) | `BACNET_APPLICATION_TAG_BIT_STRING` | 毎スキャン監視 |
-| Event_State | 36 | Required | R | BACnetEventState (ENUMERATED) | `BACNET_APPLICATION_TAG_ENUMERATED` | 毎スキャン監視 |
-| Reliability | 103 | Optional | R | BACnetReliability (ENUMERATED) | `BACNET_APPLICATION_TAG_ENUMERATED` | アプリ内部更新 |
-| Out_Of_Service | 81 | Required | RW | BOOLEAN | `BACNET_APPLICATION_TAG_BOOLEAN` | 毎スキャン書込 |
-| Polarity | 90 | Required | RW | BACnetPolarity (ENUMERATED: NORMAL=0 / REVERSE=1) | `BACNET_APPLICATION_TAG_ENUMERATED` | 初回設定（WP更新あり） |
-| Active_Text | 4 | Optional | R | CharacterString | `BACNET_APPLICATION_TAG_CHARACTER_STRING` | 初回設定（ユーザー値） |
-| Inactive_Text | 46 | Optional | R | CharacterString | `BACNET_APPLICATION_TAG_CHARACTER_STRING` | 初回設定（ユーザー値） |
-| Property_List | 371 | Required | R | BACnetARRAY[N] of BACnetPropertyIdentifier (ENUMERATED) | `BACNET_APPLICATION_TAG_ENUMERATED` | ライブラリ固定 |
+| プロパティ名 | 概要 | Property Identifier | ASHRAE区分 | アクセス | BACnetデータ型 | `BACNET_APPLICATION_TAG` | サーバ更新区分 |
+|---|---|---|---|---|---|---|---|
+| Object_Identifier | このオブジェクトを識別する数値コード。デバイス内で一意 | 75 | Required | R | BACnetObjectIdentifier | `BACNET_APPLICATION_TAG_OBJECT_ID` | ライブラリ固定 |
+| Object_Name | デバイス内で一意のオブジェクト名文字列（最低1文字） | 77 | Required | R | CharacterString | `BACNET_APPLICATION_TAG_CHARACTER_STRING` | 初回設定（ユーザー値） |
+| Object_Type | オブジェクト種別を示す読み取り専用プロパティ（BINARY_INPUT固定） | 79 | Required | R | BACnetObjectType (ENUMERATED) | `BACNET_APPLICATION_TAG_ENUMERATED` | ライブラリ固定 |
+| Present_Value | バイナリ入力の論理状態（INACTIVE / ACTIVE）。Out_Of_Service=TRUEの場合のみ書き込み可 | 85 | Required | R | BACnetBinaryPV (ENUMERATED: INACTIVE=0 / ACTIVE=1) | `BACNET_APPLICATION_TAG_ENUMERATED` | 毎スキャン書込 |
+| Description | 内容が制限されない任意の印刷可能文字列 | 28 | Optional | R | CharacterString | `BACNET_APPLICATION_TAG_CHARACTER_STRING` | 初回設定（ユーザー値） |
+| Status_Flags | オブジェクトの健全性を示す4ビットフラグ（IN_ALARM / FAULT / OVERRIDDEN / OUT_OF_SERVICE） | 111 | Required | R | BACnetStatusFlags (BIT STRING) | `BACNET_APPLICATION_TAG_BIT_STRING` | 毎スキャン監視 |
+| Event_State | 現在のイベント状態。イベント報告非対応時はNORMAL | 36 | Required | R | BACnetEventState (ENUMERATED) | `BACNET_APPLICATION_TAG_ENUMERATED` | 毎スキャン監視 |
+| Reliability | Present_Valueまたは物理入力が信頼できるかどうかの表示 | 103 | Optional | R | BACnetReliability (ENUMERATED) | `BACNET_APPLICATION_TAG_ENUMERATED` | アプリ内部更新 |
+| Out_Of_Service | TRUEのとき物理入力とPresent_Valueが切り離される | 81 | Required | RW | BOOLEAN | `BACNET_APPLICATION_TAG_BOOLEAN` | 毎スキャン書込 |
+| Polarity | 物理的状態と論理状態の対応関係（NORMAL：小真対応 / REVERSE：反転） | 90 | Required | RW | BACnetPolarity (ENUMERATED: NORMAL=0 / REVERSE=1) | `BACNET_APPLICATION_TAG_ENUMERATED` | 初回設定（WP更新あり） |
+| Active_Text | ACTIVE状態を人間可読に表現する文字列 | 4 | Optional | R | CharacterString | `BACNET_APPLICATION_TAG_CHARACTER_STRING` | 初回設定（ユーザー値） |
+| Inactive_Text | INACTIVE状態を人間可読に表現する文字列 | 46 | Optional | R | CharacterString | `BACNET_APPLICATION_TAG_CHARACTER_STRING` | 初回設定（ユーザー値） |
+| Property_List | このオブジェクトに存在するプロパティ識別子の配列 | 371 | Required | R | BACnetARRAY[N] of BACnetPropertyIdentifier (ENUMERATED) | `BACNET_APPLICATION_TAG_ENUMERATED` | ライブラリ固定 |
 
 > `Present_Value` は `Out_Of_Service = TRUE` の場合のみ書き込み可。
 
@@ -868,24 +890,24 @@ ASHRAE 135-2024 Table 12-6 に基づくモニタッチ対応プロパティ。
 
 ASHRAE 135-2024 Table 12-8 に基づくモニタッチ対応プロパティ。
 
-| プロパティ名 | Property Identifier | ASHRAE区分 | アクセス | BACnetデータ型 | `BACNET_APPLICATION_TAG` | サーバ更新区分 |
-|---|---|---|---|---|---|---|
-| Object_Identifier | 75 | Required | R | BACnetObjectIdentifier | `BACNET_APPLICATION_TAG_OBJECT_ID` | ライブラリ固定 |
-| Object_Name | 77 | Required | R | CharacterString | `BACNET_APPLICATION_TAG_CHARACTER_STRING` | 初回設定（ユーザー値） |
-| Object_Type | 79 | Required | R | BACnetObjectType (ENUMERATED) | `BACNET_APPLICATION_TAG_ENUMERATED` | ライブラリ固定 |
-| Present_Value | 85 | Required | RW | BACnetBinaryPV (ENUMERATED: INACTIVE=0 / ACTIVE=1) | `BACNET_APPLICATION_TAG_ENUMERATED` | 毎スキャン書込 |
-| Description | 28 | Optional | R | CharacterString | `BACNET_APPLICATION_TAG_CHARACTER_STRING` | 初回設定（ユーザー値） |
-| Status_Flags | 111 | Required | R | BACnetStatusFlags (BIT STRING) | `BACNET_APPLICATION_TAG_BIT_STRING` | 毎スキャン監視 |
-| Event_State | 36 | Required | R | BACnetEventState (ENUMERATED) | `BACNET_APPLICATION_TAG_ENUMERATED` | 毎スキャン監視 |
-| Reliability | 103 | Optional | R | BACnetReliability (ENUMERATED) | `BACNET_APPLICATION_TAG_ENUMERATED` | アプリ内部更新 |
-| Out_Of_Service | 81 | Required | RW | BOOLEAN | `BACNET_APPLICATION_TAG_BOOLEAN` | 毎スキャン書込 |
-| Polarity | 90 | Required | RW | BACnetPolarity (ENUMERATED: NORMAL=0 / REVERSE=1) | `BACNET_APPLICATION_TAG_ENUMERATED` | 初回設定（WP更新あり） |
-| Active_Text | 4 | Optional | R | CharacterString | `BACNET_APPLICATION_TAG_CHARACTER_STRING` | 初回設定（ユーザー値） |
-| Inactive_Text | 46 | Optional | R | CharacterString | `BACNET_APPLICATION_TAG_CHARACTER_STRING` | 初回設定（ユーザー値） |
-| Priority_Array | 87 | Required | R | BACnetPriorityArray (16要素配列) | `BACNET_APPLICATION_TAG_NULL` / `BACNET_APPLICATION_TAG_ENUMERATED` | ライブラリ管理 |
-| Relinquish_Default | 104 | Required | RW | BACnetBinaryPV (ENUMERATED) | `BACNET_APPLICATION_TAG_ENUMERATED` | 初回設定（WP更新あり） |
-| Current_Command_Priority | 431 | Required | R | BACnetOptionalUnsigned (NULL(0で表現) または Unsigned 1〜16) | `BACNET_APPLICATION_TAG_UNSIGNED_INT` | 毎スキャン監視 |
-| Property_List | 371 | Required | R | BACnetARRAY[N] of BACnetPropertyIdentifier (ENUMERATED) | `BACNET_APPLICATION_TAG_ENUMERATED` | ライブラリ固定 |
+| プロパティ名 | 概要 | Property Identifier | ASHRAE区分 | アクセス | BACnetデータ型 | `BACNET_APPLICATION_TAG` | サーバ更新区分 |
+|---|---|---|---|---|---|---|---|
+| Object_Identifier | このオブジェクトを識別する数値コード。デバイス内で一意 | 75 | Required | R | BACnetObjectIdentifier | `BACNET_APPLICATION_TAG_OBJECT_ID` | ライブラリ固定 |
+| Object_Name | デバイス内で一意のオブジェクト名文字列（最低1文字） | 77 | Required | R | CharacterString | `BACNET_APPLICATION_TAG_CHARACTER_STRING` | 初回設定（ユーザー値） |
+| Object_Type | オブジェクト種別を示す読み取り専用プロパティ（BINARY_OUTPUT固定） | 79 | Required | R | BACnetObjectType (ENUMERATED) | `BACNET_APPLICATION_TAG_ENUMERATED` | ライブラリ固定 |
+| Present_Value | バイナリ出力の論理状態（INACTIVE / ACTIVE）。BACnetコマンド優先制御に従う | 85 | Required | RW | BACnetBinaryPV (ENUMERATED: INACTIVE=0 / ACTIVE=1) | `BACNET_APPLICATION_TAG_ENUMERATED` | 毎スキャン書込 |
+| Description | 内容が制限されない任意の印刷可能文字列 | 28 | Optional | R | CharacterString | `BACNET_APPLICATION_TAG_CHARACTER_STRING` | 初回設定（ユーザー値） |
+| Status_Flags | オブジェクトの健全性を示す4ビットフラグ（IN_ALARM / FAULT / OVERRIDDEN / OUT_OF_SERVICE） | 111 | Required | R | BACnetStatusFlags (BIT STRING) | `BACNET_APPLICATION_TAG_BIT_STRING` | 毎スキャン監視 |
+| Event_State | 現在のイベント状態。イベント報告非対応時はNORMAL | 36 | Required | R | BACnetEventState (ENUMERATED) | `BACNET_APPLICATION_TAG_ENUMERATED` | 毎スキャン監視 |
+| Reliability | Present_Valueまたは物理出力の信頼性の表示 | 103 | Optional | R | BACnetReliability (ENUMERATED) | `BACNET_APPLICATION_TAG_ENUMERATED` | アプリ内部更新 |
+| Out_Of_Service | TRUEのとき物理出力とPresent_Valueが切り離される | 81 | Required | RW | BOOLEAN | `BACNET_APPLICATION_TAG_BOOLEAN` | 毎スキャン書込 |
+| Polarity | 物理出力状態と論理状態の対応関係（NORMAL：小真対応 / REVERSE：反転） | 90 | Required | RW | BACnetPolarity (ENUMERATED: NORMAL=0 / REVERSE=1) | `BACNET_APPLICATION_TAG_ENUMERATED` | 初回設定（WP更新あり） |
+| Active_Text | ACTIVE状態を人間可読に表現する文字列 | 4 | Optional | R | CharacterString | `BACNET_APPLICATION_TAG_CHARACTER_STRING` | 初回設定（ユーザー値） |
+| Inactive_Text | INACTIVE状態を人間可読に表現する文字列 | 46 | Optional | R | CharacterString | `BACNET_APPLICATION_TAG_CHARACTER_STRING` | 初回設定（ユーザー値） |
+| Priority_Array | 読み取り専用。現在有効な優先制御コマンドの16段階配列 | 87 | Required | R | BACnetPriorityArray (16要素配列) | `BACNET_APPLICATION_TAG_NULL` / `BACNET_APPLICATION_TAG_ENUMERATED` | ライブラリ管理 |
+| Relinquish_Default | Priority_Arrayがすべてnullのときに使用されるデフォルト値 | 104 | Required | RW | BACnetBinaryPV (ENUMERATED) | `BACNET_APPLICATION_TAG_ENUMERATED` | 初回設定（WP更新あり） |
+| Current_Command_Priority | 読み取り専用。現在有効な優先度インデックス（1〜16、nullはRelinquish_Default使用中） | 431 | Required | R | BACnetOptionalUnsigned (NULL(0で表現) または Unsigned 1〜16) | `BACNET_APPLICATION_TAG_UNSIGNED_INT` | 毎スキャン監視 |
+| Property_List | このオブジェクトに存在するプロパティ識別子の配列 | 371 | Required | R | BACnetARRAY[N] of BACnetPropertyIdentifier (ENUMERATED) | `BACNET_APPLICATION_TAG_ENUMERATED` | ライブラリ固定 |
 
 > **Present_Value 書き込み Priority 設計方針**
 > - Priority はインスタンス単位で個別に設定可能とする。設定値は固定となり、動的変更は行わない
@@ -899,64 +921,33 @@ ASHRAE 135-2024 Table 12-8 に基づくモニタッチ対応プロパティ。
 
 ASHRAE 135-2024 Table 12-11 に基づくモニタッチ対応プロパティ。
 
-| プロパティ名 | Property Identifier | ASHRAE区分 | アクセス | BACnetデータ型 | `BACNET_APPLICATION_TAG` | サーバ更新区分 |
-|---|---|---|---|---|---|---|
-| Object_Identifier | 75 | Required | R | BACnetObjectIdentifier | `BACNET_APPLICATION_TAG_OBJECT_ID` | ライブラリ固定 |
-| Object_Name | 77 | Required | RW | CharacterString | `BACNET_APPLICATION_TAG_CHARACTER_STRING` | 初回設定（WP更新あり） |
-| Object_Type | 79 | Required | R | BACnetObjectType (ENUMERATED) | `BACNET_APPLICATION_TAG_ENUMERATED` | ライブラリ固定 |
-| System_Status | 112 | Required | R | BACnetDeviceStatus (ENUMERATED) | `BACNET_APPLICATION_TAG_ENUMERATED` | 毎スキャン書込 |
-| Vendor_Name | 121 | Required | R | CharacterString | `BACNET_APPLICATION_TAG_CHARACTER_STRING` | 初回設定（内部固定） |
-| Vendor_Identifier | 120 | Required | R | Unsigned16 | `BACNET_APPLICATION_TAG_UNSIGNED_INT` | 初回設定（内部固定） |
-| Model_Name | 70 | Required | R | CharacterString | `BACNET_APPLICATION_TAG_CHARACTER_STRING` | 初回設定（内部固定） |
-| Firmware_Revision | 44 | Required | R | CharacterString | `BACNET_APPLICATION_TAG_CHARACTER_STRING` | 初回設定（内部固定） |
-| Application_Software_Version | 12 | Required | R | CharacterString | `BACNET_APPLICATION_TAG_CHARACTER_STRING` | 初回設定（内部固定） |
-| Protocol_Version | 98 | Required | R | Unsigned | `BACNET_APPLICATION_TAG_UNSIGNED_INT` | ライブラリ固定 |
-| Protocol_Revision | 139 | Required | R | Unsigned | `BACNET_APPLICATION_TAG_UNSIGNED_INT` | ライブラリ固定 |
-| Protocol_Services_Supported | 97 | Required | R | BACnetServicesSupported (BIT STRING) | `BACNET_APPLICATION_TAG_BIT_STRING` | ライブラリ固定 |
-| Protocol_Object_Types_Supported | 96 | Required | R | BACnetObjectTypesSupported (BIT STRING) | `BACNET_APPLICATION_TAG_BIT_STRING` | ライブラリ固定 |
-| Object_List | 76 | Required | R | BACnetObjectIdentifier の配列 | `BACNET_APPLICATION_TAG_OBJECT_ID` | ライブラリ管理 |
-| Max_APDU_Length_Accepted | 62 | Required | R | Unsigned | `BACNET_APPLICATION_TAG_UNSIGNED_INT` | ライブラリ固定 |
-| Segmentation_Supported | 107 | Required | R | BACnetSegmentation (ENUMERATED) | `BACNET_APPLICATION_TAG_ENUMERATED` | ライブラリ固定 |
-| APDU_Timeout | 11 | Required | RW | Unsigned | `BACNET_APPLICATION_TAG_UNSIGNED_INT` | 初回設定（WP更新あり） |
-| Number_Of_APDU_Retries | 73 | Required | RW | Unsigned | `BACNET_APPLICATION_TAG_UNSIGNED_INT` | 初回設定（WP更新あり） |
-| Device_Address_Binding | 30 | Required | R | BACnetAddressBinding のリスト | — | ライブラリ管理 |
-| Database_Revision | 155 | Required | R | Unsigned | `BACNET_APPLICATION_TAG_UNSIGNED_INT` | 毎スキャン監視 |
-| Property_List | 371 | Required | R | BACnetARRAY[N] of BACnetPropertyIdentifier (ENUMERATED) | `BACNET_APPLICATION_TAG_ENUMERATED` | ライブラリ固定 |
+| プロパティ名 | 概要 | Property Identifier | ASHRAE区分 | アクセス | BACnetデータ型 | `BACNET_APPLICATION_TAG` | サーバ更新区分 |
+|---|---|---|---|---|---|---|---|
+| Object_Identifier | インターネットワーク全体で一意の数値コード | 75 | Required | R | BACnetObjectIdentifier | `BACNET_APPLICATION_TAG_OBJECT_ID` | ライブラリ固定 |
+| Object_Name | インターネットワーク全体で一意の名前文字列。WP可能 | 77 | Required | RW | CharacterString | `BACNET_APPLICATION_TAG_CHARACTER_STRING` | 初回設定（WP更新あり） |
+| Object_Type | オブジェクト種別を示す読み取り専用プロパティ（DEVICE固定） | 79 | Required | R | BACnetObjectType (ENUMERATED) | `BACNET_APPLICATION_TAG_ENUMERATED` | ライブラリ固定 |
+| System_Status | デバイスの現在の物理的・論理的状態（OPERATIONAL等） | 112 | Required | R | BACnetDeviceStatus (ENUMERATED) | `BACNET_APPLICATION_TAG_ENUMERATED` | 毎スキャン書込 |
+| Vendor_Name | デバイスのベンダー名文字列 | 121 | Required | R | CharacterString | `BACNET_APPLICATION_TAG_CHARACTER_STRING` | 初回設定（内部固定） |
+| Vendor_Identifier | ASHRAEに登録されたベンダー ID番号 | 120 | Required | R | Unsigned16 | `BACNET_APPLICATION_TAG_UNSIGNED_INT` | 初回設定（内部固定） |
+| Model_Name | デバイスのモデル名文字列 | 70 | Required | R | CharacterString | `BACNET_APPLICATION_TAG_CHARACTER_STRING` | 初回設定（内部固定） |
+| Firmware_Revision | ファームウェアのリビジョン文字列 | 44 | Required | R | CharacterString | `BACNET_APPLICATION_TAG_CHARACTER_STRING` | 初回設定（内部固定） |
+| Application_Software_Version | アプリケーションソフトウェアのバージョン文字列 | 12 | Required | R | CharacterString | `BACNET_APPLICATION_TAG_CHARACTER_STRING` | 初回設定（内部固定） |
+| Protocol_Version | 準拠するBACnetプロトコルのバージョン番号 | 98 | Required | R | Unsigned | `BACNET_APPLICATION_TAG_UNSIGNED_INT` | ライブラリ固定 |
+| Protocol_Revision | プロトコルリビジョン番号 | 139 | Required | R | Unsigned | `BACNET_APPLICATION_TAG_UNSIGNED_INT` | ライブラリ固定 |
+| Protocol_Services_Supported | デバイスがサポートするBACnetサービスのビット列 | 97 | Required | R | BACnetServicesSupported (BIT STRING) | `BACNET_APPLICATION_TAG_BIT_STRING` | ライブラリ固定 |
+| Protocol_Object_Types_Supported | デバイスがサポートするBACnetオブジェクト型のビット列 | 96 | Required | R | BACnetObjectTypesSupported (BIT STRING) | `BACNET_APPLICATION_TAG_BIT_STRING` | ライブラリ固定 |
+| Object_List | デバイス内の全オブジェクト識別子の配列 | 76 | Required | R | BACnetObjectIdentifier の配列 | `BACNET_APPLICATION_TAG_OBJECT_ID` | ライブラリ管理 |
+| Max_APDU_Length_Accepted | 受け入れ可能なAPDUの最大バイト長 | 62 | Required | R | Unsigned | `BACNET_APPLICATION_TAG_UNSIGNED_INT` | ライブラリ固定 |
+| Segmentation_Supported | APDUセグメンテーションの対応状況 | 107 | Required | R | BACnetSegmentation (ENUMERATED) | `BACNET_APPLICATION_TAG_ENUMERATED` | ライブラリ固定 |
+| APDU_Timeout | 確認済みAPDU送信後の応答待機タイムアウト（ミリ秒） | 11 | Required | RW | Unsigned | `BACNET_APPLICATION_TAG_UNSIGNED_INT` | 初回設定（WP更新あり） |
+| Number_Of_APDU_Retries | APDUの最大再送回数 | 73 | Required | RW | Unsigned | `BACNET_APPLICATION_TAG_UNSIGNED_INT` | 初回設定（WP更新あり） |
+| Device_Address_Binding | デバイスIDとネットワークアドレスのバインディングリスト | 30 | Required | R | BACnetAddressBinding のリスト | — | ライブラリ管理 |
+| Database_Revision | オブジェクト変更時にインクリメントされるデータベースリビジョン番号 | 155 | Required | R | Unsigned | `BACNET_APPLICATION_TAG_UNSIGNED_INT` | 毎スキャン監視 |
+| Property_List | このオブジェクトに存在するプロパティ識別子の配列 | 371 | Required | R | BACnetARRAY[N] of BACnetPropertyIdentifier (ENUMERATED) | `BACNET_APPLICATION_TAG_ENUMERATED` | ライブラリ固定 |
 
 > `Protocol_Services_Supported` の各ビット定義は [BACnetServicesSupported](#bacnetservicessupported) を参照。
 
 > `Protocol_Object_Types_Supported` の各ビット定義は [BACnetObjectTypesSupported](#bacnetobjecttypessupported) を参照。
-
----
-
-## ASHRAE 135 との差異一覧
-
-以下のプロパティは ASHRAE 135-2024 のアクセス定義とモニタッチ実装が異なる。
-
-| Object | プロパティ名 | Property ID | ASHRAE 135 アクセス | モニタッチ実装 | 源ファイル |
-|---|---|---|---|---|---|
-| AI | Description | 28 | W | `WRITE_ACCESS_DENIED` | `ai.c` |
-| AO | Description | 28 | W | `WRITE_ACCESS_DENIED` | `ao.c` |
-| AO | Relinquish_Default | 104 | W | `WRITE_ACCESS_DENIED` | `ao.c` |
-| BI | Description | 28 | W | `WRITE_ACCESS_DENIED` | `bi.c` |
-| BI | Active_Text | 4 | W | `WRITE_ACCESS_DENIED` | `bi.c` |
-| BI | Inactive_Text | 46 | W | `WRITE_ACCESS_DENIED` | `bi.c` |
-| BO | Description | 28 | W | `WRITE_ACCESS_DENIED` | `bo.c` |
-| BO | Active_Text | 4 | W | `WRITE_ACCESS_DENIED` | `bo.c` |
-| BO | Inactive_Text | 46 | W | `WRITE_ACCESS_DENIED` | `bo.c` |
-| Device | System_Status | 112 | W（省略可能） | R（bacnet-stack はWP受付可、モニタッチとして変更不可設計） | `device.c` |
-| Device | Model_Name | 70 | W | R（bacnet-stack はWP受付可、モニタッチとして変更不可設計） | `device.c` |
-| NP (BIP) | BACnet_IP_Mode | 408 | W | `WRITE_ACCESS_DENIED` | `netport.c` |
-| NP (BIP) | BACnet_IP_UDP_Port | 412 | W | `WRITE_ACCESS_DENIED` | `netport.c` |
-| NP (BIP) | Network_Number | 425 | W | `WRITE_ACCESS_DENIED` | `netport.c` |
-| NP (BIP) | IP_Address | 400 | W（DHCP無効時） | `WRITE_ACCESS_DENIED` | `netport.c` |
-| NP (BIP) | IP_Subnet_Mask | 411 | W（DHCP無効時） | `WRITE_ACCESS_DENIED` | `netport.c` |
-| NP (BIP) | IP_Default_Gateway | 401 | W（DHCP無効時） | `WRITE_ACCESS_DENIED` | `netport.c` |
-| NP (BIP) | IP_DNS_Server | 406 | W（DHCP無効時） | `WRITE_ACCESS_DENIED` | `netport.c` |
-
-> AI/AO/BI/BO・NP の `WRITE_ACCESS_DENIED` は `Write_Property` 内に対応 `case` がないことによる。  
-> Device の `System_Status`・`Model_Name` は bacnet-stack がWPを受け付けるが、モニタッチとして外部からの変更を不可とする設計方針による。  
-> NP (BIP) の `IP_Address` 等は ASHRAE 135 で DHCP 無効時に W と定義されるが、WP 実装の義務は規定されていない（実装オプション）。
 
 ---
 
@@ -974,19 +965,19 @@ ASHRAE 135-2024 Table 12-56 に基づくモニタッチ対応プロパティ。
 
 ASHRAE 135-2024 Table 12-71 に基づく全 Network_Type 共通プロパティ。
 
-| プロパティ名 | Property Identifier | ASHRAE区分 | アクセス | BACnetデータ型 | `BACNET_APPLICATION_TAG` | サーバ更新区分 |
-|---|---|---|---|---|---|---|
-| Object_Identifier | 75 | Required | R | BACnetObjectIdentifier | `BACNET_APPLICATION_TAG_OBJECT_ID` | ライブラリ固定 |
-| Object_Name | 77 | Required | R | CharacterString | `BACNET_APPLICATION_TAG_CHARACTER_STRING` | 初回設定（ユーザー値） |
-| Object_Type | 79 | Required | R | BACnetObjectType (ENUMERATED) | `BACNET_APPLICATION_TAG_ENUMERATED` | ライブラリ固定 |
-| Description | 28 | Optional | R | CharacterString | `BACNET_APPLICATION_TAG_CHARACTER_STRING` | 初回設定（ユーザー値） |
-| Status_Flags | 111 | Required | R | BACnetStatusFlags (BIT STRING) | `BACNET_APPLICATION_TAG_BIT_STRING` | 毎スキャン監視 |
-| Reliability | 103 | Required | R | BACnetReliability (ENUMERATED) | `BACNET_APPLICATION_TAG_ENUMERATED` | アプリ内部更新 |
-| Out_Of_Service | 81 | Required | R | BOOLEAN | `BACNET_APPLICATION_TAG_BOOLEAN` | 初回設定（内部固定） |
-| Network_Type | 427 | Required | R | BACnetNetworkType (ENUMERATED) | `BACNET_APPLICATION_TAG_ENUMERATED` | 初回設定（内部固定） |
-| Protocol_Level | 482 | Required | R | BACnetProtocolLevel (ENUMERATED) | `BACNET_APPLICATION_TAG_ENUMERATED` | ライブラリ固定 |
-| Changes_Pending | 416 | Required | R | BOOLEAN | `BACNET_APPLICATION_TAG_BOOLEAN` | 毎スキャン監視 |
-| Property_List | 371 | Required | R | BACnetARRAY[N] of BACnetPropertyIdentifier | `BACNET_APPLICATION_TAG_ENUMERATED` | ライブラリ固定 |
+| プロパティ名 | 概要 | Property Identifier | ASHRAE区分 | アクセス | BACnetデータ型 | `BACNET_APPLICATION_TAG` | サーバ更新区分 |
+|---|---|---|---|---|---|---|---|
+| Object_Identifier | このオブジェクトを識別する数値コード。デバイス内で一意 | 75 | Required | R | BACnetObjectIdentifier | `BACNET_APPLICATION_TAG_OBJECT_ID` | ライブラリ固定 |
+| Object_Name | デバイス内で一意のオブジェクト名文字列（最低1文字） | 77 | Required | R | CharacterString | `BACNET_APPLICATION_TAG_CHARACTER_STRING` | 初回設定（ユーザー値） |
+| Object_Type | オブジェクト種別を示す読み取り専用プロパティ（NETWORK_PORT固定） | 79 | Required | R | BACnetObjectType (ENUMERATED) | `BACNET_APPLICATION_TAG_ENUMERATED` | ライブラリ固定 |
+| Description | 内容が制限されない任意の印刷可能文字列 | 28 | Optional | R | CharacterString | `BACNET_APPLICATION_TAG_CHARACTER_STRING` | 初回設定（ユーザー値） |
+| Status_Flags | ポートの健全性を示す4ビットフラグ（IN_ALARM / FAULT / OVERRIDDEN / OUT_OF_SERVICE） | 111 | Required | R | BACnetStatusFlags (BIT STRING) | `BACNET_APPLICATION_TAG_BIT_STRING` | 毎スキャン監視 |
+| Reliability | ポートが信頼できるかどうかの表示 | 103 | Required | R | BACnetReliability (ENUMERATED) | `BACNET_APPLICATION_TAG_ENUMERATED` | アプリ内部更新 |
+| Out_Of_Service | TRUEのとき物理ポートがサービス外 | 81 | Required | R | BOOLEAN | `BACNET_APPLICATION_TAG_BOOLEAN` | 初回設定（内部固定） |
+| Network_Type | ネットワーク通信方式の種別（BIP=5 / MSTP=2） | 427 | Required | R | BACnetNetworkType (ENUMERATED) | `BACNET_APPLICATION_TAG_ENUMERATED` | 初回設定（内部固定） |
+| Protocol_Level | このポートのBACnetプロトコル階層レベル | 482 | Required | R | BACnetProtocolLevel (ENUMERATED) | `BACNET_APPLICATION_TAG_ENUMERATED` | ライブラリ固定 |
+| Changes_Pending | TRUEのとき未適用の設定変更が存在する | 416 | Required | R | BOOLEAN | `BACNET_APPLICATION_TAG_BOOLEAN` | 毎スキャン監視 |
+| Property_List | このオブジェクトに存在するプロパティ識別子の配列 | 371 | Required | R | BACnetARRAY[N] of BACnetPropertyIdentifier | `BACNET_APPLICATION_TAG_ENUMERATED` | ライブラリ固定 |
 
 > `Status_Flags` の各ビット定義は [BACnetStatusFlags](#bacnetstatusflags) を参照。
 
@@ -1012,28 +1003,28 @@ ASHRAE 135-2024 Table 12-71 に基づく全 Network_Type 共通プロパティ�
 
 ASHRAE 135-2024 Table 12-71.4 の順序に基づく。
 
-| プロパティ名 | Property Identifier | ASHRAE区分 | アクセス | BACnetデータ型 | `BACNET_APPLICATION_TAG` | サーバ更新区分 |
-|---|---|---|---|---|---|---|
-| Network_Number | 425 | Optional（PR≥24） | R | Unsigned16 | `BACNET_APPLICATION_TAG_UNSIGNED_INT` | 初回設定（ユーザー値） |
-| Network_Number_Quality | 426 | Optional（PR≥24） | R | BACnetNetworkNumberQuality (ENUMERATED) | `BACNET_APPLICATION_TAG_ENUMERATED` | 初回設定（内部固定） |
-| APDU_Length | 399 | Optional（PR≥24） | R | Unsigned | `BACNET_APPLICATION_TAG_UNSIGNED_INT` | ライブラリ固定 |
-| MAC_Address | 423 | Optional | R | OCTET STRING（6バイト: IPv4アドレス4バイト + UDPポート2バイト） | `BACNET_APPLICATION_TAG_OCTET_STRING` | 初回設定（内部固定） |
-| BACnet_IP_Mode | 408 | Required | R | BACnetIPMode (ENUMERATED: NORMAL=0 / FOREIGN=1 / BBMD=2) | `BACNET_APPLICATION_TAG_ENUMERATED` | 初回設定（ユーザー値） |
-| BACnet_IP_UDP_Port | 412 | Required | R | Unsigned16（デフォルト 0xBAC0 = 47808） | `BACNET_APPLICATION_TAG_UNSIGNED_INT` | 初回設定（ユーザー値） |
-| BBMD_Broadcast_Distribution_Table | 414 | Required（BBMD時） | RW | BACnetBDTEntry のリスト | — | ライブラリ管理 |
-| BBMD_Accept_FD_Registrations | 413 | Required（BBMD時） | RW | BOOLEAN | `BACNET_APPLICATION_TAG_BOOLEAN` | 初回設定（WP更新あり） |
-| BBMD_Foreign_Device_Table | 415 | Required（BBMD時） | R | BACnetFDTEntry のリスト | — | ライブラリ管理 |
-| FD_BBMD_Address | 418 | Required（FOREIGN時） | RW | BACnetHostNPort | — | 初回設定（WP更新あり） |
-| FD_Subscription_Lifetime | 419 | Required（FOREIGN時） | RW | Unsigned16（秒） | `BACNET_APPLICATION_TAG_UNSIGNED_INT` | 初回設定（WP更新あり） |
-| IP_Address | 400 | Required | R | OCTET STRING（4バイト IPv4） | `BACNET_APPLICATION_TAG_OCTET_STRING` | 初回設定（内部固定） |
-| IP_Subnet_Mask | 411 | Required | R | OCTET STRING（4バイト） | `BACNET_APPLICATION_TAG_OCTET_STRING` | 初回設定（内部固定） |
-| IP_Default_Gateway | 401 | Required | R | OCTET STRING（4バイト IPv4） | `BACNET_APPLICATION_TAG_OCTET_STRING` | 初回設定（内部固定） |
-| IP_DNS_Server | 406 | Required | R | OCTET STRING のリスト（各4バイト） | `BACNET_APPLICATION_TAG_OCTET_STRING` | 初回設定（内部固定） |
-| IP_DHCP_Enable | 402 | Required（DHCP対応時） | R | BOOLEAN | `BACNET_APPLICATION_TAG_BOOLEAN` | 初回設定（内部固定） |
-| IP_DHCP_Lease_Time | 403 | Required（DHCP対応時） | R | Unsigned | `BACNET_APPLICATION_TAG_UNSIGNED_INT` | アプリ内部更新 |
-| IP_DHCP_Lease_Time_Remaining | 404 | Required（DHCP対応時） | R | Unsigned | `BACNET_APPLICATION_TAG_UNSIGNED_INT` | ライブラリ固定 |
-| IP_DHCP_Server | 405 | Required（DHCP対応時） | R | OCTET STRING（4バイト） | `BACNET_APPLICATION_TAG_OCTET_STRING` | アプリ内部更新 |
-| Link_Speed | 420 | Optional（PR≥24） | R | REAL（bps） | `BACNET_APPLICATION_TAG_REAL` | ライブラリ固定 |
+| プロパティ名 | 概要 | Property Identifier | ASHRAE区分 | アクセス | BACnetデータ型 | `BACNET_APPLICATION_TAG` | サーバ更新区分 |
+|---|---|---|---|---|---|---|---|
+| Network_Number | このBACnetネットワークのネットワーク番号 | 425 | Optional（PR≥24） | R | Unsigned16 | `BACNET_APPLICATION_TAG_UNSIGNED_INT` | 初回設定（ユーザー値） |
+| Network_Number_Quality | Network_Numberの信頼性（CONFIGURED / LEARNED等） | 426 | Optional（PR≥24） | R | BACnetNetworkNumberQuality (ENUMERATED) | `BACNET_APPLICATION_TAG_ENUMERATED` | 初回設定（内部固定） |
+| APDU_Length | このポートでサポートするAPDUの最大バイト長 | 399 | Optional（PR≥24） | R | Unsigned | `BACNET_APPLICATION_TAG_UNSIGNED_INT` | ライブラリ固定 |
+| MAC_Address | IPv4アドレス（4バイト）＋UDPポート（2バイト）を連結した6バイトOCTET STRING | 423 | Optional | R | OCTET STRING（6バイト: IPv4アドレス4バイト + UDPポート2バイト） | `BACNET_APPLICATION_TAG_OCTET_STRING` | 初回設定（内部固定） |
+| BACnet_IP_Mode | BACnet/IP動作モード（NORMAL / FOREIGN / BBMD） | 408 | Required | R | BACnetIPMode (ENUMERATED: NORMAL=0 / FOREIGN=1 / BBMD=2) | `BACNET_APPLICATION_TAG_ENUMERATED` | 初回設定（ユーザー値） |
+| BACnet_IP_UDP_Port | BACnet/IP通信で使用するUDPポート番号（デフォルト47808） | 412 | Required | R | Unsigned16（デフォルト 0xBAC0 = 47808） | `BACNET_APPLICATION_TAG_UNSIGNED_INT` | 初回設定（ユーザー値） |
+| BBMD_Broadcast_Distribution_Table | BBMDのブロードキャスト配布テーブル | 414 | Required（BBMD時） | RW | BACnetBDTEntry のリスト | — | ライブラリ管理 |
+| BBMD_Accept_FD_Registrations | Foreign Device登録の受付有効/無効フラグ | 413 | Required（BBMD時） | RW | BOOLEAN | `BACNET_APPLICATION_TAG_BOOLEAN` | 初回設定（WP更新あり） |
+| BBMD_Foreign_Device_Table | 登録済みForeign Deviceのテーブル（読み取り専用） | 415 | Required（BBMD時） | R | BACnetFDTEntry のリスト | — | ライブラリ管理 |
+| FD_BBMD_Address | Foreign Deviceとして登録する中継BBMDのアドレス（BACnetHostNPort型） | 418 | Required（FOREIGN時） | RW | BACnetHostNPort | — | 初回設定（WP更新あり） |
+| FD_Subscription_Lifetime | Foreign Device登録の有効期限（秒） | 419 | Required（FOREIGN時） | RW | Unsigned16（秒） | `BACNET_APPLICATION_TAG_UNSIGNED_INT` | 初回設定（WP更新あり） |
+| IP_Address | ポートのIPv4アドレス（4バイト） | 400 | Required | R | OCTET STRING（4バイト IPv4） | `BACNET_APPLICATION_TAG_OCTET_STRING` | 初回設定（内部固定） |
+| IP_Subnet_Mask | サブネットマスク（4バイト） | 411 | Required | R | OCTET STRING（4バイト） | `BACNET_APPLICATION_TAG_OCTET_STRING` | 初回設定（内部固定） |
+| IP_Default_Gateway | デフォルトゲートウェイのIPv4アドレス | 401 | Required | R | OCTET STRING（4バイト IPv4） | `BACNET_APPLICATION_TAG_OCTET_STRING` | 初回設定（内部固定） |
+| IP_DNS_Server | DNSサーバアドレスのリスト（各4バイト） | 406 | Required | R | OCTET STRING のリスト（各4バイト） | `BACNET_APPLICATION_TAG_OCTET_STRING` | 初回設定（内部固定） |
+| IP_DHCP_Enable | DHCPによる自動アドレス割当の有効/無効 | 402 | Required（DHCP対応時） | R | BOOLEAN | `BACNET_APPLICATION_TAG_BOOLEAN` | 初回設定（内部固定） |
+| IP_DHCP_Lease_Time | DHCPリース時間（秒） | 403 | Required（DHCP対応時） | R | Unsigned | `BACNET_APPLICATION_TAG_UNSIGNED_INT` | アプリ内部更新 |
+| IP_DHCP_Lease_Time_Remaining | DHCPリース残存時間（秒） | 404 | Required（DHCP対応時） | R | Unsigned | `BACNET_APPLICATION_TAG_UNSIGNED_INT` | ライブラリ固定 |
+| IP_DHCP_Server | DHCPサーバのIPアドレス（4バイト） | 405 | Required（DHCP対応時） | R | OCTET STRING（4バイト） | `BACNET_APPLICATION_TAG_OCTET_STRING` | アプリ内部更新 |
+| Link_Speed | リンク速度（bps）。BIPでは常に0.0 | 420 | Optional（PR≥24） | R | REAL（bps） | `BACNET_APPLICATION_TAG_REAL` | ライブラリ固定 |
 
 > BIP の場合、`Link_Speed` は bacnet-stack が常に 0.0 を返す。アプリによる Setter 呼び出しも WP も不要（ライブラリ固定）。
 
@@ -1076,21 +1067,62 @@ ASHRAE 135-2024 Table 12-71.4 の順序に基づく。
 
 ASHRAE 135-2024 Table 12-71.6 の順序に基づく。
 
-| プロパティ名 | Property Identifier | ASHRAE区分 | アクセス | BACnetデータ型 | `BACNET_APPLICATION_TAG` | サーバ更新区分 |
-|---|---|---|---|---|---|---|
-| Network_Number | 425 | Optional（PR≥24） | R | Unsigned16 | `BACNET_APPLICATION_TAG_UNSIGNED_INT` | 初回設定（ユーザー値） |
-| Network_Number_Quality | 426 | Optional（PR≥24） | R | BACnetNetworkNumberQuality (ENUMERATED) | `BACNET_APPLICATION_TAG_ENUMERATED` | 初回設定（内部固定） |
-| APDU_Length | 399 | Optional（PR≥24） | R | Unsigned | `BACNET_APPLICATION_TAG_UNSIGNED_INT` | ライブラリ固定 |
-| MAC_Address | 423 | Optional | RW | OCTET STRING（1バイト: ステーションアドレス） | `BACNET_APPLICATION_TAG_OCTET_STRING` | 初回設定（WP更新あり） |
-| Link_Speed | 420 | Optional（PR≥24） | RW | REAL（bps） | `BACNET_APPLICATION_TAG_REAL` | 初回設定（WP更新あり） |
-| Link_Speeds | 421 | Optional（PR≥24） | R | BACnetARRAY[N] of REAL（bps） | `BACNET_APPLICATION_TAG_REAL` | ライブラリ固定 |
-| Max_Manager | 64 | Optional ※3 | RW | Unsigned（0〜127） | `BACNET_APPLICATION_TAG_UNSIGNED_INT` | 初回設定（WP更新あり） |
-| Max_Info_Frames | 63 | Optional ※3 | RW | Unsigned | `BACNET_APPLICATION_TAG_UNSIGNED_INT` | 初回設定（WP更新あり） |
+| プロパティ名 | 概要 | Property Identifier | ASHRAE区分 | アクセス | BACnetデータ型 | `BACNET_APPLICATION_TAG` | サーバ更新区分 |
+|---|---|---|---|---|---|---|---|
+| Network_Number | このBACnetネットワークのネットワーク番号 | 425 | Optional（PR≥24） | R | Unsigned16 | `BACNET_APPLICATION_TAG_UNSIGNED_INT` | 初回設定（ユーザー値） |
+| Network_Number_Quality | Network_Numberの信頼性（CONFIGURED / LEARNED等） | 426 | Optional（PR≥24） | R | BACnetNetworkNumberQuality (ENUMERATED) | `BACNET_APPLICATION_TAG_ENUMERATED` | 初回設定（内部固定） |
+| APDU_Length | このポートでサポートするAPDUの最大バイト長 | 399 | Optional（PR≥24） | R | Unsigned | `BACNET_APPLICATION_TAG_UNSIGNED_INT` | ライブラリ固定 |
+| MAC_Address | MS/TPステーションアドレス（0〜127）を格納し1バイトOCTET STRING | 423 | Optional | RW | OCTET STRING（1バイト: ステーションアドレス） | `BACNET_APPLICATION_TAG_OCTET_STRING` | 初回設定（WP更新あり） |
+| Link_Speed | シリアル通信ボーレート（bps）。WP受付可だが実際の通信速度は変化しない | 420 | Optional（PR≥24） | RW | REAL（bps） | `BACNET_APPLICATION_TAG_REAL` | 初回設定（WP更新あり） |
+| Link_Speeds | サポートするボーレートの一覧（読み取り専用配列） | 421 | Optional（PR≥24） | R | BACnetARRAY[N] of REAL（bps） | `BACNET_APPLICATION_TAG_REAL` | ライブラリ固定 |
+| Max_Manager | MS/TPネットワーク上のマネージャノードの最大アドレス番号（0〜127） | 64 | Optional ※3 | RW | Unsigned（0〜127） | `BACNET_APPLICATION_TAG_UNSIGNED_INT` | 初回設定（WP更新あり） |
+| Max_Info_Frames | トークン保持中に送信できる最大フレーム数 | 63 | Optional ※3 | RW | Unsigned | `BACNET_APPLICATION_TAG_UNSIGNED_INT` | 初回設定（WP更新あり） |
 
 > ※3 MSTP マネージャノードの場合のみ Required（ASHRAE 135-2024 Clause 12.56.55 / 12.56.56）。モニタッチは常にマネージャノードとして動作するため実装必須。  
 > MS/TP のステーションアドレス（0〜127）は `MAC_Address`（1バイト OCTET STRING）として表現される。  
 > `Link_Speed` は有効なボーレート値（9600 / 19200 / 38400 / 57600 / 76800 / 115200 bps）の WP を受け付けるが、**実際のシリアル通信速度は変化しない**。  
 > `Link_Speeds` は bacnet-stack がサポートするボーレートの一覧を固定配列（`{ 9600, 19200, 38400, 57600, 76800, 115200 }`）として返す。
+
+#### MS/TP シリアル通信パラメータ（固定値）
+
+BACnet/MS/TP のシリアル通信パラメータは以下の値に固定である。
+
+| パラメータ | 値 |
+|---|---|
+| データ長 | 8bit |
+| パリティ | なし |
+| ストップビット | 1 |
+
+---
+
+## ASHRAE 135 との差異一覧
+
+以下のプロパティは ASHRAE 135-2024 のアクセス定義とモニタッチ実装が異なる。
+
+| Object | プロパティ名 | Property ID | ASHRAE 135 アクセス | モニタッチ実装 | 源ファイル |
+|---|---|---|---|---|---|
+| AI | Description | 28 | W | `WRITE_ACCESS_DENIED` | `ai.c` |
+| AO | Description | 28 | W | `WRITE_ACCESS_DENIED` | `ao.c` |
+| AO | Relinquish_Default | 104 | W | `WRITE_ACCESS_DENIED` | `ao.c` |
+| BI | Description | 28 | W | `WRITE_ACCESS_DENIED` | `bi.c` |
+| BI | Active_Text | 4 | W | `WRITE_ACCESS_DENIED` | `bi.c` |
+| BI | Inactive_Text | 46 | W | `WRITE_ACCESS_DENIED` | `bi.c` |
+| BO | Description | 28 | W | `WRITE_ACCESS_DENIED` | `bo.c` |
+| BO | Active_Text | 4 | W | `WRITE_ACCESS_DENIED` | `bo.c` |
+| BO | Inactive_Text | 46 | W | `WRITE_ACCESS_DENIED` | `bo.c` |
+| Device | System_Status | 112 | W（省略可能） | R（bacnet-stack はWP受付可、モニタッチとして変更不可設計） | `device.c` |
+| Device | Model_Name | 70 | W | R（bacnet-stack はWP受付可、モニタッチとして変更不可設計） | `device.c` |
+| NP (BIP) | BACnet_IP_Mode | 408 | W | `WRITE_ACCESS_DENIED` | `netport.c` |
+| NP (BIP) | BACnet_IP_UDP_Port | 412 | W | `WRITE_ACCESS_DENIED` | `netport.c` |
+| NP (BIP) | Network_Number | 425 | W | `WRITE_ACCESS_DENIED` | `netport.c` |
+| NP (BIP) | IP_Address | 400 | W（DHCP無効時） | `WRITE_ACCESS_DENIED` | `netport.c` |
+| NP (BIP) | IP_Subnet_Mask | 411 | W（DHCP無効時） | `WRITE_ACCESS_DENIED` | `netport.c` |
+| NP (BIP) | IP_Default_Gateway | 401 | W（DHCP無効時） | `WRITE_ACCESS_DENIED` | `netport.c` |
+| NP (BIP) | IP_DNS_Server | 406 | W（DHCP無効時） | `WRITE_ACCESS_DENIED` | `netport.c` |
+
+> AI/AO/BI/BO・NP の `WRITE_ACCESS_DENIED` は `Write_Property` 内に対応 `case` がないことによる。  
+> Device の `System_Status`・`Model_Name` は bacnet-stack がWPを受け付けるが、モニタッチとして外部からの変更を不可とする設計方針による。  
+> NP (BIP) の `IP_Address` 等は ASHRAE 135 で DHCP 無効時に W と定義されるが、WP 実装の義務は規定されていない（実装オプション）。
 
 ---
 
@@ -1144,6 +1176,12 @@ ASHRAE 135-2024 Table 12-71.6 の順序に基づく。
 | AO/BO/AV/BV 等 | `PROP_PRIORITY_ARRAY` | Priority スロット値の配列（Array Index 指定で個別スロット取得も可） | 詳細は下記参照 |
 
 > 出力データの形式はプロパティによって異なる。ユーザーは最大出力バイト数に十分な領域を確保した上で本マクロを呼び出すこと。
+
+> [!NOTE]
+> **T.B.D. — クライアント機能によるリスト型プロパティのリード**  
+> モニタッチがBACnetクライアントとして、リモート機器のリスト型プロパティ（`BACnetLIST`）を読み取る場合は、通常のクライアント読み取り機能（8WAY通信経由・デバイスメモリ固定割り当て）では対応できないため、専用の読み取りマクロでの対応が必要と考えられる。  
+> リスト型プロパティは要素数が相手デバイスの状態により可変であり、プロジェクト作成時に確定したバイト数割り当てと整合しないためである。  
+> **現時点では未決定。** ユーザーがリスト型プロパティのデータをクライアント側から読み取る必要があるか否かが確認されていないため、実装要否の判断を保留している。
 
 ---
 
@@ -1251,4 +1289,10 @@ bacnet-stack 内部関数を直接呼び出し、コマンダブルプロパテ�
 - NULL 書き込みはコマンダブルプロパティ（AO / BO / AV / BV 等の `Present_Value`）に対してのみ有効
 - NULL を書き込むと、指定した Priority スロットの占有が解放され、より低い Priority の値が有効になる（または `Relinquish_Default` に戻る）
 - 非コマンダブルプロパティに対して NULL を書き込んだ場合はエラーが返ることがある（機器依存）
+
+> [!NOTE]
+> **T.B.D. — クライアント機能によるリスト型プロパティのライト**  
+> モニタッチがBACnetクライアントとして、リモート機器のリスト型プロパティ（`BACnetLIST`）に書き込む場合は、通常のクライアント書き込み機能（8WAY通信経由・デバイスメモリ固定割り当て）では対応できないため、専用の書き込みマクロでの対応が必要と考えられる。  
+> リスト型プロパティへの書き込みは全体の一括置換となり（インデックス単位の書き込みは規格上不可）、要素追加・削除は `AddListElement` / `RemoveListElement` サービスの利用が必要となるため、固定バイト数の割り当てとは設計上相容れないためである。  
+> **現時点では未決定。** ユーザーがリスト型プロパティのデータをクライアント側から書き込む必要があるか否かが確認されていないため、実装要否の判断を保留している。
 
