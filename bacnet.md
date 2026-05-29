@@ -1,5 +1,9 @@
 ## 目次
 
+- [アーキテクチャ概要](#アーキテクチャ概要)
+  - [プロセス構成](#プロセス構成)
+  - [IPC種別と使い分け](#ipc種別と使い分け)
+  - [各セクションの読み順](#各セクションの読み順)
 - [BACnetクライアント機能](#bacnetクライアント機能)
   - [機能概要](#機能概要)
   - [配列・リスト型プロパティのアクセス制約](#配列リスト型プロパティのアクセス制約)
@@ -13,10 +17,30 @@
   - [クラス構成](#クラス構成-1)
   - [構造図（Mermaid）](#構造図mermaid-1)
     - [クラス構成図](#クラス構成図-1)
+    - [データフロー図](#データフロー図-1)
     - [シーケンス図（サーバ起動）](#シーケンス図サーバ起動)
     - [シーケンス図（周期更新）](#シーケンス図周期更新)
     - [シーケンス図（外部クライアントによるサーバデータ更新）](#シーケンス図外部クライアントによるサーバデータ更新)
-    - [データフロー図](#データフロー図-1)
+- [Property同期メカニズム（QSharedMemory）](#property同期メカニズムqsharedmemory)
+  - [概要](#概要)
+  - [関連クラスとファイル](#関連クラスとファイル)
+  - [共有メモリレイアウト](#共有メモリレイアウト)
+  - [更新状態（updateState）](#更新状態updatestate)
+  - [構造図](#構造図)
+    - [共有メモリ構造図](#共有メモリ構造図)
+    - [updateState 状態遷移図](#updatestate-状態遷移図)
+    - [データフロー図](#データフロー図-2)
+    - [シーケンス図（デバイスメモリ変化→BACnet Property反映）](#シーケンス図デバイスメモリ変化bacnet-property反映)
+    - [シーケンス図（外部WP受信・内部値変化→デバイスメモリ反映）](#シーケンス図外部wp受信内部値変化デバイスメモリ反映)
+- [BACnetExecutorプロセス](#bacnetexecutorプロセス)
+  - [機能概要](#機能概要-2)
+  - [クラス構成](#クラス構成-2)
+  - [構造図（Mermaid）](#構造図mermaid-2)
+    - [クラス構成図](#クラス構成図-2)
+    - [シーケンス図（プロセス起動）](#シーケンス図プロセス起動)
+    - [シーケンス図（RP/WP要求処理）](#シーケンス図rpwp要求処理)
+    - [シーケンス図（外部BACnet WP受信・Property同期）](#シーケンス図外部bacnet-wp受信property同期)
+    - [シーケンス図（周期処理）](#シーケンス図周期処理)
 - [モニタッチで対応する機能一覧](#モニタッチで対応する機能一覧)
   - [Device Profile（Annex L）](#device-profileannex-l)
   - [BIBBs（対応サービス一覧）](#bibbs対応サービス一覧)
@@ -28,6 +52,7 @@
 - [モニタッチで対応するObject Type一覧](#モニタッチで対応するobject-type一覧)
 - [モニタッチで対応するプロパティ一覧](#モニタッチで対応するプロパティ一覧)
   - [共通事項](#共通事項)
+    - [エディタ設定項目の要否（サーバ更新区分別）](#エディタ設定項目の要否サーバ更新区分別)
     - [使用データ型一覧](#使用データ型一覧)
   - [BIT_STRING ビット定義](#bit_string-ビット定義)
     - [アプリ側キャッシュの割り当て方針](#アプリ側キャッシュの割り当て方針)
@@ -57,23 +82,94 @@
   - [動作仕様](#動作仕様-1)
   - [対応プロパティ](#対応プロパティ)
   - [NULL 書き込み（Relinquish）の注意事項](#null-書き込みrelinquishの注意事項)
+- [Appendix: bacnet-stack Setter/Getter リファレンス](#appendix-bacnet-stack-settergetter-リファレンス)
+
+# アーキテクチャ概要
+
+## プロセス構成
+
+BACnet機能は **Monitouchメインプロセス** と **BACnetExecutorプロセス** の2プロセス構成で実装されています。  
+bacnet-stackライブラリの実行はBACnetExecutorプロセスが専任し、Monitouchメインプロセスとは2種類のIPCで連携します。  
+BACnetExecutorプロセスはEthernet（BACnet/IP）用とSerial（BACnet/MSTP）用の2インスタンスが存在します。
+
+```mermaid
+graph TD
+    subgraph MT[Monitouchメインプロセス]
+        IF[HKC_IFSysBACnet クライアントI/F]
+        SvcE[HKC_BACnetServiceEthernet]
+        SvcS[HKC_BACnetServiceSerial]
+    end
+
+    subgraph EE[BACnetExecutorプロセス Ethernet]
+        AE[BACnet_Application]
+    end
+
+    subgraph ES[BACnetExecutorプロセス Serial]
+        AS[BACnet_Application]
+    end
+
+    SME[(QSharedMemory Ethernet用)]
+    SMS[(QSharedMemory Serial用)]
+    ExtE[(外部BACnet IP機器)]
+    ExtS[(外部BACnet MSTP機器)]
+
+    IF --> SvcE
+    IF --> SvcS
+    SvcE <-->|"IPC-A  UDP コマンド制御"| AE
+    SvcS <-->|"IPC-A  UDP コマンド制御"| AS
+    SvcE <-->|"IPC-B  Property値同期"| SME
+    AE <-->|"IPC-B  Property値同期"| SME
+    SvcS <-->|"IPC-B  Property値同期"| SMS
+    AS <-->|"IPC-B  Property値同期"| SMS
+    AE <-->|"BACnet/IP"| ExtE
+    AS <-->|"BACnet/MSTP"| ExtS
+
+    style MT fill:#e8f4ff,stroke:#1a4d8c
+    style EE fill:#f1f8e9,stroke:#2e7d32
+    style ES fill:#f1f8e9,stroke:#2e7d32
+    style SME fill:#fff3e0,stroke:#e65100
+    style SMS fill:#fff3e0,stroke:#e65100
+```
+
+## IPC種別と使い分け
+
+MonitouchプロセスとBACnetExecutorプロセスの間のIPCは用途に応じて2種類使い分けています。
+
+| 種別 | 通信方式 | 用途 | 特性 |
+|---|---|---|---|
+| IPC-A コマンドIPC | QUdpSocket（localhost）| サーバ起動/停止・RP/WP要求・Object削除・LinkClearなどの制御コマンド送受信 | 要求/応答型。送信ごとに応答を待つ同期/非同期2モード。コマンド種別は`CommandType`列挙体で識別。 |
+| IPC-B Property同期 | QSharedMemory + QSystemSemaphore | BACnet Property値とMonitouchデバイスメモリの双方向同期（高頻度） | 共有メモリにエントリごとの`updateState`（0/1/2）を設けて方向と状態を管理する。詳細: → [Property同期メカニズム（QSharedMemory）](#property同期メカニズムqsharedmemory) |
+
+## 各セクションの読み順
+
+| 読む順 | セクション | 読む目的 |
+|---|---|---|
+| 1 | [このセクション](#アーキテクチャ概要) | 全体のプロセス構成とIPCの使い分けを把握する |
+| 2 | [BACnetクライアント機能](#bacnetクライアント機能) | HMI画面→外部BACnet機器へのRead/Write I/F層を理解する |
+| 3 | [BACnetサーバ機能](#bacnetサーバ機能) | 外部BACnetクライアントからの受け付けとMonitouchデバイスメモリ同期を理解する |
+| 4 | [Property同期メカニズム（QSharedMemory）](#property同期メカニズムqsharedmemory) | IPC-Bの詳細（共有メモリレイアウト・updateState遷移・シーケンス）を理解する |
+| 5 | [BACnetExecutorプロセス](#bacnetexecutorプロセス) | BACnetライブラリ実行専任プロセスの内部動作を理解する |
+
+---
 
 # BACnetクライアント機能
 
 ## 機能概要
 
 BACnetクライアント機能は、HMI画面側からドライバ経由でBACnet機器へアクセスし、Object/PropertyのRead/Writeを行う機能です。  
-ドライバとHMIアプリ間は既存の8WAY通信I/Fでやり取りされ、HKC_IFSysBacnet系クラスが8WAY要求をBACnetサービス呼び出しへ変換します。  
-本セクションではクライアントI/F層を対象とし、HKC_BacnetService以降（サービス内部処理、ラッパ、スタック内部）は対象外とします。
+ドライバとHMIアプリ間は既存の8WAY通信I/Fでやり取りされ、`HKC_IFSysBACnet`系クラスが8WAY要求をBACnetサービス呼び出しへ変換します。  
+BACnetサービス（`HKC_BACnetService`）はEthernet用（`HKC_BACnetServiceEthernet`）とSerial用（`HKC_BACnetServiceSerial`）に分かれており、それぞれが対応するモードのBACnetExecutorプロセスへUDP（localhost）経由でIPCします。  
+本セクションではクライアントI/F層を対象とし、`HKC_BACnetService`以降のIPC処理・BACnetExecutor内部処理・bacnet-stack操作は対象外とします（→ [BACnetExecutorプロセス](#bacnetexecutorプロセス) 参照）。
 
 | 項目 | 内容 |
 |---|---|
-| 通信I/F | 8WAY通信I/F（send8Way/recv8Way/generalProc8Way） |
+| 通信I/F | 8WAY通信I/F（送信/受信/汎用処理） |
 | 対応機能 | ReadProperty / WriteProperty |
 | 対応データ型 | [使用データ型一覧](#使用データ型一覧) |
 | 接続先解決 | 接続先テーブル情報からDeviceIdを取得して要求先を決定 |
-| 呼出先 | HKC_BacnetServiceにReadProperty/WriteProperty要求を依頼 |
-| 範囲外 | HKC_BacnetService以降の内部処理（ライブラリ呼び出し、Who-Is、静的バインド管理など）は本セクションの対象外 |
+| 呼出先 | HKC_BACnetServiceEthernet / HKC_BACnetServiceSerialにReadProperty/WriteProperty要求を依頼 |
+| 通信モード別サービス | Ethernet（BIP）用はHKC_BACnetServiceEthernet、Serial（MSTP）用はHKC_BACnetServiceSerial |
+| 範囲外 | HKC_BACnetService以降のIPC処理（BACnetExecutorへのUDP送信、Who-Is、静的バインド管理など）は本セクションの対象外 |
 
 ## 配列・リスト型プロパティのアクセス制約
 
@@ -93,19 +189,26 @@ BACnet規格上、配列型（BACnetARRAY）およびリスト型（BACnetLIST�
 
 BACnetLIST はインデックスという概念が型仕様に存在せず、ReadProperty / WriteProperty では常に全体（`BACNET_ARRAY_ALL` 相当 = `array_index` 省略）での一括アクセスのみが規格上定義されている。要素単位の追加・削除は `AddListElement` / `RemoveListElement` サービスを使用する。
 
-モニタッチのクライアント機能の設計上、`BACNET_ARRAY_ALL` による一括アクセスに対応しておらず、かつ応答サイズが相手デバイスの状態によって可変となるため、**クライアント機能としてのリスト型プロパティへのアクセスは通常の8WAY通信経由では対応できない。対応する場合は専用マクロによるリード/ライトが必要となる想定**（→ [BACnetライブラリ管理プロパティ 読み取りマクロ](#bacnetライブラリ管理プロパティ-読み取りマクロ) および [BACnet Priority Write / Relinquish 書き込みマクロ](#bacnet-priority-write--relinquish-書き込みマクロ) の T.B.D. 参照）。
+モニタッチのクライアント機能では、**リスト型プロパティのリード/ライトに通常の8WAY通信経由で対応する。** ただし以下の制約がある。
+
+- **リード**：全データを一括取得し、ユーザーが指定したインデックスの要素をデバイスメモリへ格納する。指定インデックスの要素が存在しない場合はエラーを返す。
+- **ライト（Read-Modify-Write）**：まず全データをリードして内部に保持し、ユーザーが指定したインデックスの要素のみを変更した上で全体をライトする。指定インデックスの要素が存在しない場合はエラーを返す。要素の追加・削除には対応しない。
+
+全データのリード/ライトや要素の追加・削除が必要な場合は、専用マクロでの対応が必要となる。
 
 ## クラス構成
 
 | 分類 | クラス/構造体 | 役割 | ファイル |
 |---|---|---|---|
-| 主体（ドライバ-BACnet変換） | HKC_IFSysBacnetEthernet | HKC_IFSysEthernetを継承。8WAY要求を解析し、ReadProperty/WriteProperty要求をHKC_BacnetServiceへ中継。接続先テーブルからDeviceIdを取得し、応答データを8WAY受信バッファへ格納。 | V10/src/com/interface/library/BACnet/HKC_IFSysBacnetEthernet.h<br>V10/src/com/interface/library/BACnet/HKC_IFSysBacnetEthernet.cpp |
-| 主体（ドライバ-BACnet変換: Serial拡張予定） | HKC_IFSysBacnetSerial | HKC_IFSysBacnetEthernetと同一の役割・処理構成を想定。相違点は継承元のみで、HKC_IFSysEthernetの代わりにHKC_IFSysSerialを継承する想定。ReadProperty/WriteProperty要求の中継先やサービス層以降の構成は共通。 | V10/src/com/interface/library/BACnet/HKC_IFSysBacnetSerial.h<br>V10/src/com/interface/library/BACnet/HKC_IFSysBacnetSerial.cpp |
-| 制御（BACnetサービス） | HKC_BacnetService | reqReadProperty/reqWritePropertyを受け、BACnet処理を実行して戻り値データを保持。クライアントIFからgetReturnDataで参照される。内部でHKC_BacnetWrapperAPIを保持。 | V10/src/sys/service/HKC_BacnetService.h<br>V10/src/sys/service/HKC_BacnetService.cpp |
-| 補助（ライブラリラッパ） | HKC_BacnetWrapperAPI | bacnet-stack関連ライブラリのロード/アンロード、関数ポインタ解決、各API呼び出しをラップ。address_add/address_set_device_TTL等の呼び出し窓口。 | V10/src/sys/service/BACnet/HKC_BacnetWrapperAPI.h<br>V10/src/sys/service/BACnet/HKC_BacnetWrapperAPI.cpp |
-| 補助（I/F要求応答構造体） | Bacnet_Send_Common<br>Bacnet_Recv_Common<br>Bacnet_Send_ReadProperty<br>Bacnet_Send_WriteProperty | HKC_IFSysBacnetEthernet/HKC_IFSysBacnetSerialの送受信バッファで使用する要求/応答データ形式。 | Grobal/include/DrvLibraryStruct.h |
-| 外部基底クラス | HKC_IFSysEthernet | Ethernet 8WAY通信の共通処理を提供。HKC_IFSysBacnetEthernetはこれを継承し、BACnet独自のsend/recv処理を実装。 | V9/src/com/interface/HKC_IFSysEthernet.h<br>V9/src/com/interface/HKC_IFSysEthernet.cpp |
-| 外部基底クラス | HKC_IFSysSerial | Serial 8WAY通信の共通処理を提供する想定基底クラス。HKC_IFSysBacnetSerialではこの基底に差し替える。 | V9/src/com/interface/HKC_IFSysSerial.h |
+| 主体（BACnet共通処理 ミックスイン基底） | HKC_IFSysBACnet | EthernetとSerial共通のBACnet処理を提供するミックスイン基底クラス。ReadProperty/WriteProperty要求実行（`readProperty()`/`writeProperty()`）の実装を持ち、担当サービス取得（`bacnetService()`）は純粋仮想で各派生クラスが対応するサービスを返す。PLCテーブル取得、詳細エラー変換も担う。 | V10/src/com/interface/library/BACnet/HKC_IFSysBACnet.h<br>V10/src/com/interface/library/BACnet/HKC_IFSysBACnet.cpp |
+| 主体（ドライバ-BACnet変換: Ethernet） | HKC_IFSysBACnetEthernet | `HKC_IFSysBACnet`と`HKC_IFSysEthernet`を多重継承。8WAY要求を解析しReadProperty/WriteProperty要求を`HKC_BACnetServiceEthernet`へ中継。接続先テーブルからDeviceIdを取得し、応答データを8WAY受信バッファへ格納。 | V10/src/com/interface/library/BACnet/HKC_IFSysBACnetEthernet.h<br>V10/src/com/interface/library/BACnet/HKC_IFSysBACnetEthernet.cpp |
+| 主体（ドライバ-BACnet変換: Serial） | HKC_IFSysBACnetSerial | `HKC_IFSysBACnet`と`HKC_IFSysSerial`を多重継承。`HKC_IFSysBACnetEthernet`と同一の役割・処理構成。現時点ではスタブ実装。`bacnetService()`は`HKC_BACnetServiceSerial`を返す。 | V10/src/com/interface/library/BACnet/HKC_IFSysBACnetSerial.h<br>V10/src/com/interface/library/BACnet/HKC_IFSysBACnetSerial.cpp |
+| 制御（BACnetサービス基底） | HKC_BACnetService | Read/Write要求受付（`reqReadProperty`/`reqWriteProperty`）を受け、HKC_BACnetCommandExecutor経由でBACnetExecutorプロセスへUDP（localhost）でIPCを送信し、応答データを保持する。クライアントIFから応答データ参照（`getReturnData`）で参照される。Ethernet/Serial用の共通処理を持つ基底クラス。 | V10/src/sys/service/BACnet/HKC_BacnetService.h<br>V10/src/sys/service/BACnet/HKC_BACnetService.cpp |
+| 制御（BACnetサービス: Ethernet） | HKC_BACnetServiceEthernet | `HKC_BACnetService`を継承。Ethernet用BACnetExecutorプロセスとIPC通信するサービス。Ethernet用のIPCポートを使用する。担当サービス取得（`bacnetService()`）がグローバルインスタンス経由でEthernetサービスを参照する。 | V10/src/sys/service/BACnet/HKC_BACnetServiceEthernet.h<br>V10/src/sys/service/BACnet/HKC_BACnetServiceEthernet.cpp |
+| 制御（BACnetサービス: Serial） | HKC_BACnetServiceSerial | `HKC_BACnetService`を継承。Serial用BACnetExecutorプロセスとIPC通信するサービス。Serial用のIPCポート（D_BACnetExecutorSerialPort）を使用する。 | V10/src/sys/service/BACnet/HKC_BACnetServiceSerial.h<br>V10/src/sys/service/BACnet/HKC_BACnetServiceSerial.cpp |
+| 補助（I/F要求応答構造体） | Bacnet_Send_Common<br>Bacnet_Recv_Common<br>Bacnet_Send_ReadProperty<br>Bacnet_Send_WriteProperty | HKC_IFSysBACnetEthernet/HKC_IFSysBACnetSerialの送受信バッファで使用する要求/応答データ形式。 | Grobal/include/DrvLibraryStruct.h |
+| 外部基底クラス | HKC_IFSysEthernet | Ethernet 8WAY通信の共通処理を提供。HKC_IFSysBACnetEthernetはこれを多重継承し、BACnet独自のsend/recv処理を実装。 | V9/src/com/interface/HKC_IFSysEthernet.h<br>V9/src/com/interface/HKC_IFSysEthernet.cpp |
+| 外部基底クラス | HKC_IFSysSerial | Serial 8WAY通信の共通処理を提供する基底クラス。HKC_IFSysBACnetSerialはこれを多重継承する。 | V9/src/com/interface/HKC_IFSysSerial.h |
 
 ## 構造図（Mermaid）
 
@@ -116,29 +219,40 @@ graph TD
   Driver[ドライバ層 8WAY]
   IFEth[HKC_IFSysEthernet 既存基底]
   IFSer[HKC_IFSysSerial 既存基底]
-  IFBacnet[HKC_IFSysBacnet BACnet変換層]
-  IFBacnetSer[HKC_IFSysBacnetSerial BACnet変換層 Serial]
-  Svc[HKC_BacnetService BACnetサービス]
-  Wrapper[HKC_BacnetWrapperAPI stackラッパ]
-  StackLib[(bacnet-stack ライブラリ)]
+  IFBACnet[HKC_IFSysBACnet BACnet共通ミックスイン]
+  IFBACnetEth[HKC_IFSysBACnetEthernet BACnet変換層 Ethernet]
+  IFBACnetSer[HKC_IFSysBACnetSerial BACnet変換層 Serial]
+  SvcBase[HKC_BACnetService BACnetサービス基底]
+  SvcEth[HKC_BACnetServiceEthernet Ethernetサービス]
+  SvcSer[HKC_BACnetServiceSerial Serialサービス]
+  ExecEth[(BACnetExecutorプロセス Ethernet)]
+  ExecSer[(BACnetExecutorプロセス Serial)]
   Cache[接続先テーブル/DeviceIdキャッシュ]
 
-  Driver -->|generalProc8Way / send8Way / recv8Way| IFBacnet
-  Driver -->|generalProc8Way / send8Way / recv8Way| IFBacnetSer
-  IFBacnet -->|inherits| IFEth
-  IFBacnetSer -->|inherits| IFSer
-  IFBacnet -->|Read / Write要求| Svc
-  IFBacnetSer -->|Read / Write要求| Svc
-  IFBacnet -->|getSockAddrfromCacheTable| Cache
-  IFBacnetSer -->|getSockAddrfromCacheTable| Cache
-  Svc -->|libAccess| Wrapper
-  Wrapper -->|関数呼び出し| StackLib
+  Driver -->|generalProc8Way / send8Way / recv8Way| IFBACnetEth
+  Driver -->|generalProc8Way / send8Way / recv8Way| IFBACnetSer
+  IFBACnetEth -->|inherits| IFBACnet
+  IFBACnetEth -->|inherits| IFEth
+  IFBACnetSer -->|inherits| IFBACnet
+  IFBACnetSer -->|inherits| IFSer
+  IFBACnet -->|readProperty / writeProperty| SvcEth
+  IFBACnet -->|readProperty / writeProperty| SvcSer
+  IFBACnetEth -->|"bacnetService()"| SvcEth
+  IFBACnetSer -->|"bacnetService()"| SvcSer
+  IFBACnet -->|getTargetPlcTable| Cache
+  SvcEth -->|inherits| SvcBase
+  SvcSer -->|inherits| SvcBase
+  SvcEth -->|UDP IPC| ExecEth
+  SvcSer -->|UDP IPC| ExecSer
 
-  style IFBacnet fill:#cfe2ff,stroke:#1a4d8c,stroke-width:2px
-  style IFBacnetSer fill:#cfe2ff,stroke:#1a4d8c,stroke-width:2px
-  style Svc fill:#d9ead3,stroke:#2f6b2f,stroke-width:2px
-  style Wrapper fill:#ffe6b3,stroke:#b06a00,stroke-width:2px
-  style StackLib fill:#dddddd,stroke:#666,stroke-dasharray:4 3
+  style IFBACnet fill:#e8d5f5,stroke:#6a0dad,stroke-width:2px
+  style IFBACnetEth fill:#cfe2ff,stroke:#1a4d8c,stroke-width:2px
+  style IFBACnetSer fill:#cfe2ff,stroke:#1a4d8c,stroke-width:2px
+  style SvcEth fill:#d9ead3,stroke:#2f6b2f,stroke-width:2px
+  style SvcSer fill:#d9ead3,stroke:#2f6b2f,stroke-width:2px
+  style SvcBase fill:#d9ead3,stroke:#2f6b2f,stroke-width:1px,stroke-dasharray:4 3
+  style ExecEth fill:#dddddd,stroke:#666,stroke-dasharray:4 3
+  style ExecSer fill:#dddddd,stroke:#666,stroke-dasharray:4 3
 ```
 
 ### データフロー図
@@ -150,21 +264,20 @@ graph TD
       Tag[タグデータ型]
     end
     subgraph Drv[ドライバ層]
-      Pkt[8WAYパケット]
+      Pkt[通信パケット]
       Obj[Object/Property指定組み立て]
     end
-    subgraph IF[HKC_IFSysBacnet / HKC_IFSysBacnetSerial]
-      Req[8WAY要求解析・Read/Write分岐]
-      Hand[接続先情報取得]
+    subgraph IF[BACnetサービスI/F層]
+      Req[Read/Write要求解析・分岐]
+      Hand[接続先解決]
       Resp[応答結果格納]
     end
-    subgraph Svc[HKC_BacnetService]
-      Conv[BACnet型変換]
-      APDU[BACnet要求キュー投入]
+    subgraph Svc[BACnetサービス層]
+      APDU[BACnet要求送信（IPC-A）]
       Ret[戻り値データ保持]
     end
-    subgraph Stack[BACnet-stack層]
-      Task[Read/Writeタスク実行]
+    subgraph Exec[BACnetExecutorプロセス]
+      ExecTask[BACnet通信処理]
     end
     subgraph Net[ネットワーク]
       Dev[(BACnet Device)]
@@ -172,14 +285,12 @@ graph TD
 
     UI --> Tag --> Obj --> Pkt --> Req
     Hand --> Req
-    Req --> APDU
-    Req --> Conv
-    Conv --> APDU --> Task --> Dev
-    Dev --> Task --> Ret --> Resp --> Pkt --> UI
+    Req --> APDU --> ExecTask --> Dev
+    Dev --> ExecTask --> Ret --> Resp --> Pkt --> UI
 
     style IF fill:#cfe2ff,stroke:#1a4d8c
     style Svc fill:#d9ead3,stroke:#2f6b2f
-    style Stack fill:#ffe6b3,stroke:#b06a00
+    style Exec fill:#ffe6b3,stroke:#b06a00
 ```
 
 ### シーケンス図（Read/Write要求）
@@ -187,75 +298,67 @@ graph TD
 ```mermaid
 sequenceDiagram
   participant DM as ドライバマネージャ
-  participant BAC as HKC_IFSysBacnet
-  participant SVC as HKC_BacnetService
-  participant WRP as HKC_BacnetWrapperAPI
-  participant STK as bacnet-stack
+  participant BAC as HKC_IFSysBACnetEthernet<br/>（またはSerial）
+  participant SVC as HKC_BACnetServiceEthernet<br/>（またはSerial）
+  participant EXEC as BACnetExecutorプロセス
   participant DEV as BACnet Device
 
-  DM->>BAC: send8Way(Read/Write要求パケットを送信)
-  BAC->>BAC: getHandle(接続先テーブルからDeviceIdを取得)
-  BAC->>BAC: getSockAddrfromCacheTable(局番→接続先情報を解決)
+  DM->>BAC: Read/Write要求パケットを送信（send8Way）
+  BAC->>BAC: 接続先テーブルからDeviceIdを取得（getHandle）
+  BAC->>BAC: 要求コマンドを解析してRead/Write分岐（sendWithBACnet）
+  BAC->>SVC: 要求パラメータを渡す（readProperty / writeProperty）
+  BAC->>BAC: 完了通知まで待機（loop.waitEvent）
 
-  BAC->>BAC: sendWithBacnet(要求コマンドを解析してRead/Write分岐)
-  BAC->>BAC: 要求パラメータを展開してイベント要求を生成
-  BAC->>SVC: Read/Write実行を要求
-  BAC->>BAC: loop.waitEvent(完了通知まで待機)
+  SVC->>SVC: IPC要求をシリアライズ<br/>（HKC_BACnetCommandExecutorClientXxx::request）
+  SVC->>EXEC: UDP送信 CommandType_Client_ReadProperty / WriteProperty
+  EXEC->>EXEC: BACnetコマンド実行（bacnet-stack呼び出し）
+  EXEC->>DEV: ReadProperty / WriteProperty要求
+  DEV-->>EXEC: ACK（値 / ステータス）
+  EXEC-->>SVC: UDP応答（結果データ + ステータス）
 
-  SVC->>SVC: Read/Write処理を実行
-  SVC->>WRP: Read/Write要求をキュー投入
-  WRP->>STK: ReadProperty/WriteProperty要求を実行
-  STK->>DEV: プロパティ読出し/書き込み
-  DEV-->>STK: ACK(値/ステータス)
-  STK-->>WRP: 読出し/書き込み結果を返却
-  WRP-->>SVC: デコード用データを返却
-  SVC->>SVC: コールバックで応答内容を解析
   SVC->>SVC: 戻り値データを保持
-  SVC-->>BAC: イベント完了通知(結果コードを返却)
+  SVC-->>BAC: イベント完了通知（結果コードを返却）
 
-  BAC->>BAC: convertDetailErrToEthernetErr(詳細エラーを8WAYエラーへ変換)
-  BAC->>BAC: m_aucRxDataへ応答格納(共通応答+Readの場合は読出しデータ)
-  BAC-->>DM: recv8Way(応答データを返却)
+  BAC->>BAC: 詳細エラーをモニタッチ通信エラーへ変換（convertDetailErrToMoniErr）
+  BAC->>BAC: m_aucRxDataへ応答格納（共通応答 + Readの場合は読出しデータ）
+  BAC-->>DM: 応答データを返却（recv8Way）
 ```
 
 # BACnetサーバ機能
 
 ## 機能概要
 
-BACnetサーバ機能は、HMI製品側で`HKC_BacnetService`がBACnetサービスを実行し、外部BACnetクライアントからのRead/Write要求に応答しながら、
-HMI内部メモリ（内部/PLCデバイス値）とサーバキャッシュを同期する機能です。
-ライブラリ本体にはbacnet-stackを使用し、ライブラリのロードおよびAPI呼び出しは`HKC_BacnetWrapperAPI`でラップされています。
+BACnetサーバ機能は、HMI製品側の`HKC_BACnetService`がBACnetExecutorプロセスとIPCで連携し、外部BACnetクライアントからのRead/Write要求に応答しながら、HMI内部メモリ（内部/PLCデバイス値）とBACnet Property値を同期する機能です。  
+bacnet-stackライブラリの実行はBACnetExecutorプロセスが専任し、`HKC_BACnetService`はIPCを通じてその制御を行います（→ [BACnetExecutorプロセス](#bacnetexecutorプロセス) 参照）。
 
-サーバ動作はサービススレッド`HKC_BacnetService`で管理され、システム周期処理`HKC_SysCycleBacnet`から
-周期的なメモリ監視（`getMemoryOrder`/`chkMemStat`）とデータ反映が呼び出されます。
-外部クライアントからの書き込みはライブラリコールバックを経由して、次回周期処理で実メモリへ反映されます。
+サービスはEthernet（BACnet/IP）用の`HKC_BACnetServiceEthernet`とSerial（MS/TP）用の`HKC_BACnetServiceSerial`に分かれており、それぞれが対応するBACnetExecutorプロセスのインスタンスを管理します。
+
+サーバ動作はサービススレッド`HKC_BACnetService`で管理され、システム周期処理`HKC_SysCycleBacnet`から周期的な監視メモリ取得（`getMemoryOrder`）/メモリ状態確認（`chkMemStat`）とデバイスメモリ監視更新（`updateMonitorData`）の呼び出しが行われます。  
+デバイスメモリ監視更新（`updateMonitorData`）はデバイスメモリの現在値を取得して`monitorData`を更新し、更新処理要求（`reqUpdateProcess`）→更新実行（`updateProcess`）を呼び出します。  
+`updateProcess`ではQSharedMemory経由でBACnetExecutorとProperty値を双方向に同期します（詳細: → [Property同期メカニズム（QSharedMemory）](#property同期メカニズムqsharedmemory) 参照）。
 
 | 項目 | 内容 |
 |---|---|
 | 有効化方法 | 専用の構成ファイルでBACnet関連ソースを組み込み（`V10/work/bacnet.pri`） |
-| 使用ライブラリ | bacnet-stack（DLL: `libbacnet-stack.dll`） |
-| サーバ初期化 | 環境変数設定、コールバック登録など |
-| クライアント要求受付 | Read/Write要求を非同期実行し、結果をイベントで通知 |
-| 外部書き込み反映 | コールバック機能を使用してサーバキャッシュ更新 |
-| メモリ同期 | サイクルによる周期処理で反映 |
+| bacnet-stack実行 | BACnetExecutorプロセスが専任（`libbacnet-stack.dll`） |
+| サーバ初期化 | 共有メモリ作成 → BACnetExecutor起動 → IPC: サーバ初期化コマンド送信（`CommandType_Server_Initial`） |
+| Property値の同期方式 | QSharedMemory + QSystemSemaphoreによる双方向同期（→ [Property同期メカニズム](#property同期メカニズムqsharedmemory)） |
 | BACnet対応機能 | [モニタッチで対応する機能一覧](#モニタッチで対応する機能一覧) |
 | BACnet対応Object Type | [モニタッチで対応するObject Type一覧](#モニタッチで対応するobject-type一覧) |
 | BACnet対応Object Property | [モニタッチで対応するプロパティ一覧](#モニタッチで対応するプロパティ一覧) |
-
-
-
 
 ## クラス構成
 
 | 分類 | クラス/構造体 | 役割 | ファイル |
 |---|---|---|---|
-| 主体（サービス） | HKC_BacnetService | HKC_Serviceを継承するBACnetサービスの中核クラス。サーバ起動/停止、初期設定、Object生成、監視メモリ更新、ReadProperty/WriteProperty要求受付、戻り値保持、サーバキャッシュ更新を担う。内部で通信設定、ノード一覧、監視データ、更新データ、タイマ、ライブラリアクセサを保持する。 | V10/src/sys/service/HKC_BacnetService.h<br>V10/src/sys/service/HKC_BacnetService.cpp |
-| 制御（周期） | HKC_SysCycleBacnet | HKC_SystemCycleInterfaceを継承し、システム周期で対象メモリのchkMemStatを実施した後、HKC_BacnetServiceのデータ更新処理を呼び出して監視対象データを更新する。 | V10/src/app/control/syscycle/HKC_SysCycleBacnet.h<br>V10/src/app/control/syscycle/HKC_SysCycleBacnet.cpp |
-| 制御（ライブラリ抽象化） | HKC_BacnetWrapperAPI | QObject派生。bacnet-stack系ライブラリの動的ロード、関数ポインタ解決、各種BACnet API呼び出しをラップする。Read/Write要求、Who-Is、静的バインド登録、各種encode/decode補助などの窓口となる。 | V10/src/sys/service/BACnet/HKC_BacnetWrapperAPI.h<br>V10/src/sys/service/BACnet/HKC_BacnetWrapperAPI.cpp |
-| 補助（通信設定） | HKC_BacnetServerCommSetting | 通信設定を保持するクラス。IPアドレス、デバイス名、セッションタイムアウト、接続形式、自局DeviceIdなどを保持し、内部でキャッシュ登録を行う。 | V10/src/sys/service/HKC_BacnetService.h<br>V10/src/sys/service/HKC_BacnetService.cpp |
-| 補助（ノード） | HKC_BacnetVaiableNode | BACnetのObject/Propertyに対応する内部ノード表現。 | V10/src/sys/service/HKC_BacnetService.h<br>V10/src/sys/service/HKC_BacnetService.cpp |
-| 補助（変換ユーティリティ） | HKD_BacnetNodeInfoConvert 名前空間 | BACNET_APPLICATION_DATA_VALUEとQVector<quint8>、メモリ要求、ノードキー情報の相互変換を行う関数群を提供する。書込用Variant生成、読出し値変換、ノードキー生成、メモリオーダー補正などを担う。 | V10/src/sys/service/HKC_BacnetService.h<br>V10/src/sys/service/HKC_BacnetService.cpp |
-
+| 主体（サービス基底） | HKC_BACnetService | `HKC_Service`を継承するBACnetサービスの基底クラス。サーバ起動/停止、Object生成、デバイスメモリ監視更新（`updateMonitorData`）、Property値更新判定・同期（`updateProcess`）、IPC送受信（RP/WP/ServerInitial等）、BACnetExecutorプロセス管理を担う。Ethernet/Serial共通処理を提供する。 | V10/src/sys/service/BACnet/HKC_BacnetService.h<br>V10/src/sys/service/BACnet/HKC_BACnetService.cpp |
+| 主体（サービス: Ethernet） | HKC_BACnetServiceEthernet | `HKC_BACnetService`を継承。Ethernet（BACnet/IP）用BACnetExecutorプロセスを管理するサービス。起動前画面設定確認（`checkDispData`）でEthernet用のOpcUaServerHost設定をロードする。 | V10/src/sys/service/BACnet/HKC_BACnetServiceEthernet.h<br>V10/src/sys/service/BACnet/HKC_BACnetServiceEthernet.cpp |
+| 主体（サービス: Serial） | HKC_BACnetServiceSerial | `HKC_BACnetService`を継承。Serial（MS/TP）用BACnetExecutorプロセスを管理するサービス。 | V10/src/sys/service/BACnet/HKC_BACnetServiceSerial.h<br>V10/src/sys/service/BACnet/HKC_BACnetServiceSerial.cpp |
+| 制御（周期） | HKC_SysCycleBacnet | `HKC_SystemCycleInterface`を継承し、システム周期でメモリ状態確認（`chkMemStat`）を実施した後、デバイスメモリ監視更新（`HKC_BACnetService::updateMonitorData`）を呼び出してサーバ監視データを更新する。 | V10/src/app/control/syscycle/HKC_SysCycleBacnet.h<br>V10/src/app/control/syscycle/HKC_SysCycleBacnet.cpp |
+| 制御（Property同期・Monitouch側） | HKC_BACnetPropertySyncCreator | QSharedMemory + QSystemSemaphoreを使用するProperty同期管理クラス（Monitouch側）。Property値更新判定（`updateProcess`）から呼び出される。詳細は → [Property同期メカニズム（QSharedMemory）](#property同期メカニズムqsharedmemory) 参照。 | V10/src/sys/service/BACnet/HKC_BACnetPropertySyncCreator.h<br>V10/src/sys/service/BACnet/HKC_BACnetPropertySyncCreator.cpp |
+| 補助（通信設定） | HKC_BACnetServerCommSetting | 通信設定を保持するクラス。IPアドレス、デバイス名、セッションタイムアウト、接続形式、自局DeviceIdなどを保持し、内部でキャッシュ登録を行う。 | V10/src/sys/service/BACnet/HKC_BacnetService.h<br>V10/src/sys/service/BACnet/HKC_BACnetService.cpp |
+| 補助（ノード） | HKC_BACnetVaiableNode | BACnetのObject/Propertyに対応する内部ノード表現。objectBaseInfo（objectType/objectInstance/property）、dataType、byteNum、memory等を保持する。 | V10/src/sys/service/BACnet/HKC_BacnetService.h<br>V10/src/sys/service/BACnet/HKC_BACnetService.cpp |
+| 補助（変換ユーティリティ） | HKD_BACnetNodeInfoConvert 名前空間 | BACNET_APPLICATION_DATA_VALUEとQVector<quint8>、メモリ要求、ノードキー情報の相互変換を行う関数群を提供する。ノードキー生成（`convNodeKey`）、メモリアクセス補正（`adjustMemoryOrder`）、書込バッファ変換（`convertNodeDataToWriteBuffer`）などを担う。 | V10/src/sys/service/BACnet/HKC_BacnetService.h<br>V10/src/sys/service/BACnet/HKC_BACnetService.cpp |
 
 ## 構造図（Mermaid）
 
@@ -264,110 +367,44 @@ HMI内部メモリ（内部/PLCデバイス値）とサーバキャッシュを�
 ```mermaid
 graph TD
     Base[HKC_Service サービス基底]
-    Svc[HKC_BacnetService サーバ中核]
-    Comm[HKC_BacnetServerCommSetting 通信設定]
-    Node[HKC_BacnetVaiableNode ノード管理]
-    ConvCls[encode/decode機能]
+    SvcBase[HKC_BACnetService サービス中核基底]
+    SvcEth[HKC_BACnetServiceEthernet Ethernetサービス]
+    SvcSer[HKC_BACnetServiceSerial Serialサービス]
+    Comm[HKC_BACnetServerCommSetting 通信設定]
+    Node[HKC_BACnetVaiableNode ノード管理]
+    ConvCls[HKD_BACnetNodeInfoConvert 変換ユーティリティ]
     Cache[variableNodeList<br/>monitorData / updateData<br/>listMemory]
     Timer[QTimer 周期タスク]
-    Wrapper[HKC_BacnetWrapperAPI stackラッパ]
-    StackLib[(bacnet-stack ライブラリ)]
+    Creator[HKC_BACnetPropertySyncCreator 共有メモリ管理]
+    SharedMem[(QSharedMemory Property同期)]
+    ExecEth[(BACnetExecutorプロセス Ethernet)]
+    ExecSer[(BACnetExecutorプロセス Serial)]
 
-    Svc -->|inherits| Base
-    Svc -->|owns| Comm
-    Svc -->|owns| Node
-    Svc -->|uses| ConvCls
-    Svc -->|cache| Cache
-    Svc -->|controls| Timer
-    Svc -->|libAccess| Wrapper
-    ConvCls -->|convert/decode支援| Wrapper
-    Wrapper -->|関数呼び出し| StackLib
+    SvcBase -->|inherits| Base
+    SvcEth -->|inherits| SvcBase
+    SvcSer -->|inherits| SvcBase
+    SvcBase -->|owns| Comm
+    SvcBase -->|owns| Node
+    SvcBase -->|uses| ConvCls
+    SvcBase -->|cache| Cache
+    SvcBase -->|controls| Timer
+    SvcBase -->|owns| Creator
+    Creator -->|create/readAll/write| SharedMem
+    SvcEth -->|UDP IPC| ExecEth
+    SvcSer -->|UDP IPC| ExecSer
+    ExecEth -->|attach/write/poll| SharedMem
+    ExecSer -->|attach/write/poll| SharedMem
 
-    style Svc fill:#cfe2ff,stroke:#1a4d8c,stroke-width:2px
+    style SvcBase fill:#cfe2ff,stroke:#1a4d8c,stroke-width:2px
+    style SvcEth fill:#cfe2ff,stroke:#1a4d8c,stroke-width:1px,stroke-dasharray:4 3
+    style SvcSer fill:#cfe2ff,stroke:#1a4d8c,stroke-width:1px,stroke-dasharray:4 3
     style Comm fill:#d9ead3,stroke:#2f6b2f,stroke-width:2px
     style Node fill:#d9ead3,stroke:#2f6b2f,stroke-width:2px
     style ConvCls fill:#d9ead3,stroke:#2f6b2f,stroke-width:2px
-    style Wrapper fill:#ffe6b3,stroke:#b06a00,stroke-width:2px
-    style StackLib fill:#dddddd,stroke:#666,stroke-dasharray:4 3
-```
-
-### シーケンス図（サーバ起動）
-
-```mermaid
-sequenceDiagram
-  participant Caller as 上位制御
-  participant Svc as HKC_BacnetService
-  participant Setting as HKC_BacnetServerCommSetting
-  participant Wrap as HKC_BacnetWrapperAPI
-  participant Lib as bacnet-stackライブラリ
-
-  Caller->>Svc: checkDispData(画面設定チェック要求)
-  Svc->>Svc: execCheckDispData(表示設定キャッシュ生成)
-  Svc->>Wrap: loadServerLibrary(使用ライブラリを動的ロード)
-  Wrap->>Lib: QLibrary::load + resolve(関数ポインタ解決)
-
-  Caller->>Svc: reqServerStart(サーバ起動要求)
-  Svc->>Svc: serverStart(起動シーケンス実行)
-  Svc->>Setting: HKC_BacnetServerCommSetting生成(通信設定を反映)
-  Svc->>Svc: initialSetting(初期化処理/各種環境変数を集約実行)
-  Svc->>Wrap: 各種コールバック登録、静的バインド登録、初期化関数をコール
-  Svc->>Wrap: Who Is(起動時探索要求)
-  Wrap->>Lib: bacnet初期化/Who-Is送信
-  Svc->>Svc: 周期処理タイマー開始
-  Svc-->>Caller: eventOccurred(起動結果通知)
-```
-
-### シーケンス図（周期更新）
-
-```mermaid
-sequenceDiagram
-  participant Cycle as HKC_SysCycleBacnet
-  participant Svc as HKC_BacnetService
-  participant MM as memoryManager
-  participant Wrap as HKC_BacnetWrapperAPI
-
-  Cycle->>Svc: getMemoryOrder(監視対象メモリ一覧を取得)
-  Cycle->>Cycle: chkMemStat(各メモリ状態を確認)
-  Cycle->>Svc: 監視データ更新を要求
-
-  loop 全プロパティ
-    Svc->>MM: readMemory(getCurrentDataで現在値取得)
-    Svc->>Svc: モニタデータ更新(取得値を監視キャッシュへ反映)
-  end
-
-  Svc->>Svc: 更新処理を実施
-
-  alt デバイス値変更あり
-    Svc->>Wrap: サーバ側キャッシュを更新
-  end
-
-  alt サーバ値変更あり
-    Svc->>MM: writeMemory(writeDevListへ書込要求)
-    MM-->>Svc: WaitEvent完了(書込完了通知)
-  end
-
-```
-
-### シーケンス図（外部クライアントによるサーバデータ更新）
-
-```mermaid
-sequenceDiagram
-  participant Client as BACnet Client
-  participant Lib as bacnet-stackライブラリ
-  participant Svc as HKC_BacnetService
-  participant Wrap as HKC_BacnetWrapperAPI
-
-  Client->>Lib: WritePropertyRequest(サーバObject/Propertyへ書込み)
-  Lib->>Svc: 書込成功コールバック通知
-  Svc->>Svc: サーバキャッシュ更新
-
-  alt 対象プロパティあり
-    Svc->>Wrap: 受信APDUを更新データにDecode
-    Svc->>Svc: サーバ側キャッシュのみ更新
-    Note over Svc: 実メモリ反映は次回周期更新で実施
-  else 対象プロパティなし
-    Note over Svc: 対象外として更新を無視
-  end
+    style Creator fill:#f4cccc,stroke:#a00,stroke-width:2px
+    style SharedMem fill:#f4cccc,stroke:#a00,stroke-dasharray:4 3
+    style ExecEth fill:#dddddd,stroke:#666,stroke-dasharray:4 3
+    style ExecSer fill:#dddddd,stroke:#666,stroke-dasharray:4 3
 ```
 
 ### データフロー図
@@ -379,40 +416,545 @@ graph TD
       Mem[内部/PLCメモリ]
     end
     subgraph ClientFunc[クライアント機能]
-      IFReq[HKC_IFSysBacnet Read/Write要求]
-      IFResp[HKC_IFSysBacnet 応答受信]
+      IFReq[Read/Write要求]
+      IFResp[応答受信]
     end
     subgraph Cycle[システムサイクル]
-      CycleIF[HKC_SystemCycleInterface]
+      CycleIF[周期処理]
     end
-    subgraph Svc[HKC_BacnetService]
-      Init[設定読込・Object Property生成]
-      Mon[メモリ監視]
-      Upd[更新判定]
-      Cache[サーバキャッシュ更新]
-      SvcReq[Read/Write要求受付]
-      ConvSvc[encode/decode機能]
+    subgraph SvcLayer[BACnetサービス層]
+      Init[設定読込・Object/Property生成]
+      Mon[デバイスメモリ監視]
+      Upd[Property値更新判定]
+      SvcReq["Read/Write IPC通信（IPC-A）"]
     end
-    subgraph Wrap[HKC_BacnetWrapperAPI]
-      Req[Read/Write要求処理]
+    subgraph IPC["Property値同期バッファ（IPC-B）"]
+      SM["更新状態\n0:なし / 1:Monitouch→BACnet / 2:BACnet→Monitouch"]
     end
-    subgraph Stack[BACnet-stack層]
-      Task[周期タスク/コールバック]
+    subgraph Exec[BACnetExecutorプロセス]
+      ExecTask[BACnet通信処理<br/>更新反映・値変化検出]
     end
     subgraph Net[ネットワーク]
       Client[(BACnet Client)]
     end
 
-    UI --> Init --> Cache
-  CycleIF --> Mon
-    Mem --> Mon --> Upd --> ConvSvc --> Req --> Task --> Client
-    Client --> Task --> Req --> ConvSvc --> Cache --> Upd --> Mem
-    IFReq --> SvcReq --> Req --> Task --> Client
-    Client --> Task --> Req --> SvcReq --> IFResp
+    UI --> Init
+    CycleIF --> Mon --> Upd
+    Mem --> Mon
+    Upd -->|"更新通知（Monitouch→BACnet）"| SM
+    SM -->|"Monitouch→BACnet 更新反映"| ExecTask
+    ExecTask -->|"BACnet Write"| Client
+    Client -->|"外部BACnet WP受信"| ExecTask
+    ExecTask -->|"更新通知（BACnet→Monitouch）"| SM
+    SM -->|"BACnet→Monitouch 更新取得"| Upd
+    Upd -->|"書込要求"| Mem
+    IFReq --> SvcReq -->|"Read/Write IPC送信（IPC-A）"| ExecTask
+    ExecTask -->|"IPC応答（IPC-A）"| SvcReq --> IFResp
 
-    style Svc fill:#cfe2ff,stroke:#1a4d8c
-    style Wrap fill:#d9ead3,stroke:#2f6b2f
-    style Stack fill:#ffe6b3,stroke:#b06a00
+    style SvcLayer fill:#cfe2ff,stroke:#1a4d8c
+    style IPC fill:#f4cccc,stroke:#a00
+    style Exec fill:#ffe6b3,stroke:#b06a00
+```
+
+### シーケンス図（サーバ起動）
+
+```mermaid
+sequenceDiagram
+  participant Caller as 上位制御
+  participant Svc as HKC_BACnetService
+  participant Setting as HKC_BACnetServerCommSetting
+  participant Creator as HKC_BACnetPropertySyncCreator
+  participant Proc as QProcess
+  participant Exec as BACnetExecutorプロセス
+
+  Caller->>Svc: 画面設定チェック（checkDispData）
+  Svc->>Svc: 表示設定キャッシュ生成（execCheckDispData）
+
+  Caller->>Svc: サーバ起動要求（reqServerStart）
+  Svc->>Svc: 起動シーケンス実行（serverStart）
+  Svc->>Setting: 通信設定を反映（HKC_BACnetServerCommSetting生成）
+  Svc->>Svc: 各種設定を初期化（initialSetting）
+
+  Svc->>Proc: QProcessでBACnetExecutor起動（--ethernet/--serial）<br/>（startExecutorProcess）
+  Proc-->>Exec: プロセス起動
+
+  Svc->>Creator: ノード一覧を基に共有メモリ作成（createSharedMemory）
+  Svc->>Exec: 通信設定・ノード情報をUDP送信<br/>（CommandType_Server_Initial）
+  Exec->>Exec: 環境変数設定・コールバック登録・bacnet-stack初期化（initialSetting）
+  Exec-->>Svc: UDP応答 ERROR_CODE_SUCCESS
+
+  Creator->>Creator: 共有メモリをアタッチして初期化
+  Svc->>Svc: 周期処理開始・100ms間隔（timerLoop->start / execLoop）
+  Svc-->>Caller: 起動結果通知（eventOccurred）
+```
+
+### シーケンス図（周期更新）
+
+```mermaid
+sequenceDiagram
+  participant Cycle as HKC_SysCycleBacnet
+  participant Svc as HKC_BACnetService
+  participant MM as memoryManager
+  participant Creator as HKC_BACnetPropertySyncCreator
+  participant SharedMem as QSharedMemory
+
+  Cycle->>Svc: 監視対象メモリ一覧を取得（getMemoryOrder）
+  Cycle->>Cycle: 各メモリ状態を確認（chkMemStat）
+  Cycle->>Svc: デバイスメモリ監視データを更新（updateMonitorData）
+
+  loop 全プロパティ
+    Svc->>MM: 現在値を取得（readMemory / getCurrentData）
+    Svc->>Svc: monitorData更新(取得値を監視キャッシュへ反映)
+  end
+
+  Svc->>Svc: Property値更新処理を要求・実行（reqUpdateProcess → updateProcess）
+  Svc->>Creator: 全エントリをスナップショット取得・state=2を0にリセット<br/>（readAllEntries）
+
+  loop 全スナップショット
+    alt state=2（BACnet外部WPあり）
+      Svc->>Svc: writeDevListに書込要求を追加
+      Svc->>MM: デバイスメモリへ反映（writeMemory）
+    else state=0/1（BACnet更新なし）かつデバイス値変化あり
+      Svc->>Creator: Monitouch→BACnet更新通知書込（state=1にセット）<br/>（writeMonitouchUpdate）
+      Note over Creator,SharedMem: BACnetExecutorが次の周期処理でstate=1を検出し<br/>BACnet Propertyへ反映する
+    end
+  end
+```
+
+### シーケンス図（外部クライアントによるサーバデータ更新）
+
+外部BACnetクライアントからのWriteProperty受信から共有メモリへの書き込み（state=2）はBACnetExecutorプロセス側で行われます。  
+Monitouch側（`updateProcess`）はQSharedMemoryのstate=2エントリを検出してデバイスメモリへ反映します。  
+BACnetExecutor側の詳細シーケンスは → [BACnetExecutorプロセス：外部BACnet WP受信・Property同期](#シーケンス図外部bacnet-wp受信property同期) を参照してください。
+
+```mermaid
+sequenceDiagram
+  participant Exec as BACnetExecutorプロセス
+  participant SharedMem as QSharedMemory
+  participant Svc as HKC_BACnetService
+  participant Creator as HKC_BACnetPropertySyncCreator
+  participant MM as memoryManager
+
+  Note over Exec,SharedMem: 外部BACnetクライアントのWP受信後<br/>BACnetExecutorがwriteFromBACnet(state=2)を実行済み
+
+  Svc->>Creator: 全エントリをスナップショット取得（readAllEntries）
+  Creator->>SharedMem: 全エントリ取得（セマフォ保護、state=2→0リセット）
+  SharedMem-->>Creator: EntrySnapshotリスト（state=2のエントリを含む）
+  Creator-->>Svc: QVector<EntrySnapshot>
+
+  loop state=2 のエントリ
+    Svc->>Svc: BACnetデータ→デバイスメモリ書込バッファ変換（convertNodeDataToWriteBuffer）
+    Svc->>MM: writeDevList経由でデバイスメモリへ反映（writeMemory）
+  end
+```
+
+
+# Property同期メカニズム（QSharedMemory）
+
+## 概要
+
+BACnetサーバ機能では、MonitouchプロセスとBACnetExecutorプロセスの間でBACnet Object/Property値とデバイスメモリ値の双方向同期に、**QSharedMemory + QSystemSemaphore** を使用しています。  
+このメカニズムはUDP IPCとは独立した仕組みで、Property値の高頻度な読み書きに特化して設計されています。
+
+| 特性 | 詳細 |
+|---|---|
+| 使用API | QSharedMemory（OSレベルのIPCメモリ共有）+ QSystemSemaphore（バイナリセマフォ） |
+| 用途 | BACnet Object/Property値とMonitouchデバイスメモリの双方向同期専用。サーバ起動/停止などの制御はUDP IPCを使用する。 |
+| 同期方向 | 双方向：Monitouch→BACnet（updateState=1）、BACnet→Monitouch（updateState=2） |
+| 優先度 | updateState=2（BACnet側）はupdateState=1（Monitouch側）より最高優先で上書きする |
+| 排他制御 | QSystemSemaphore（バイナリセマフォ）でデータ書き込みをアトミックに保護。セマフォキーは`getPropertySemaphoreKey(isEthernet)`で取得する。 |
+| 所有関係 | MonitouchプロセスのHKC_BACnetPropertySyncCreatorがCreate、BACnetExecutorプロセスのBACnetPropertySyncManagerがAttach/Open |
+| Ethernet/Serial分離 | Ethernet用とSerial用に別キーを使用（`getPropertySharedMemoryKey(true/false)`） |
+
+## 関連クラスとファイル
+
+| クラス/ファイル | プロセス | 役割 | ファイル |
+|---|---|---|---|
+| HKC_BACnetPropertySyncLayout.h | 両側共通 | 共有メモリのPOD型レイアウト定義（`HKC_BACnetPropertySyncSharedMemHeader`、`HKC_BACnetPropertySyncEntryHeader`、`HKC_BACnetPropertySyncUpdateState`）。両プロセスが同一ファイルをincludeすることでレイアウトの一致を保証する。 | V10/src/sys/service/BACnet/HKC_BACnetPropertySyncLayout.h |
+| HKC_BACnetPropertySyncCreator | Monitouch | 共有メモリのCreate側。サーバ起動時に共有メモリ作成・初期化（`createSharedMemory()`）で共有メモリとセマフォを作成・初期化する。Property値更新判定（`updateProcess()`）から同期スナップショット取得（`readAllEntries()`）（全エントリ取得・state=2リセット）とMonitouch更新通知書込（`writeMonitouchUpdate()`）（state=1設定）を呼び出す。BACnetExecutor再起動時は再初期化（`reinitialize()`）でセマフォと全エントリをリセットする。 | V10/src/sys/service/BACnet/HKC_BACnetPropertySyncCreator.h/.cpp |
+| BACnetPropertySyncManager | BACnetExecutor | 共有メモリのAttach側。共有メモリアタッチ・初期化（`initialize()`）でアタッチ後マジックナンバーとエントリ数を検証してインデックスキャッシュを構築する。周期処理でMonitouch→BACnet更新反映（`applyPendingMonitouchUpdates()`）（state=1→BACnet Property反映）とBACnet内部値変化検出（`pollAndSyncBACnetValues()`）（BACnet内部値変化→state=2設定）を実行する。外部WP受信時はBACnet値書込（`writeFromBACnet()`）で直接state=2を設定する。 | BACnetExecutor/src/BACnetPropertySyncManager.h/.cpp |
+
+## 共有メモリレイアウト
+
+共有メモリは以下の3領域が先頭から連続して配置されます。
+
+**全体サイズ = 16B（SharedMemHeader固定） + 16B×N（EntryHeader配列、N=エントリ数） + `dataRegionSize` B（DataRegion、全エントリのプロパティ値バイト数の総和）**
+
+| 領域 | サイズ | フィールド |
+|---|---|---|
+| SharedMemHeader | 16B固定 | `magic`(4B): 識別マジック `0xBAC34E70`（正常アタッチ確認用）<br>`entryCount`(4B): エントリ数 N（BACnetノード総数）<br>`indexTableSize`(4B): EntryHeader配列の合計バイト数（= 16B × N）<br>`dataRegionSize`(4B): DataRegion全体のバイト数（= 全エントリの`byteNum`の総和） |
+| EntryHeader[0..N-1] | 16B × N | `nodeKey`(8B): ノードキー（property<<32 \| objectType<<22 \| objectInstance）<br>`dataOffset`(4B): DataRegion先頭からのバイトオフセット（このエントリのデータ開始位置）<br>`byteNum`(2B): このエントリのProperty値バイト数（Monitouchメモリ換算）<br>`updateState`(1B): 0/1/2<br>`reserved`(1B): 0固定 |
+| DataRegion | `dataRegionSize` B<br>（全エントリの`byteNum`の総和） | 各エントリのProperty値バイト列を連続格納。各エントリは`dataOffset`を起点に`byteNum`バイト分を占有する。例: Entry 0がbyteNum=4なら先頭4B、Entry 1がbyteNum=2なら続く2B、… |
+
+ノードキー算出式: $\text{nodeKey} = (\text{propertyId} \ll 32)\ |\ (\text{objectType} \ll 22)\ |\ \text{objectInstance}$
+
+## 更新状態（updateState）
+
+エントリヘッダの`updateState`フィールド（1バイト）が同期方向と処理状態を表します。
+
+| 値 | 定数名 | 意味 | 設定する側と関数 | リセット（0に戻す）側と関数 |
+|---|---|---|---|---|
+| 0 | None | 更新なし（初期状態・処理済み） | 各側が処理後にクリア | - |
+| 1 | Monitouch | MonitouchデバイスメモリをBACnet Propertyへ反映待ち | Monitouch更新通知書込（`HKC_BACnetPropertySyncCreator::writeMonitouchUpdate()`） | Monitouch→BACnet更新反映（`BACnetPropertySyncManager::applyPendingMonitouchUpdates()`）が反映後に0へ |
+| 2 | BACnet | BACnet Property値をMonitouchデバイスメモリへ反映待ち（最高優先度） | BACnet値書込（`BACnetPropertySyncManager::writeFromBACnet()`）<br>BACnet内部値変化検出（`BACnetPropertySyncManager::pollAndSyncBACnetValues()`） | 同期スナップショット取得（`HKC_BACnetPropertySyncCreator::readAllEntries()`）が取得後に0へ |
+
+> state=2はstate=1より優先され、`writeFromBACnet()`はstate=1ペンディング中でも常にstate=2へ上書きします。  
+> state=1ペンディング中に再度デバイス値が変化した場合は後優先で最新値に上書きされます（二重処理防止のため反映前にstate=0へリセット）。
+
+## 構造図
+
+### 共有メモリ構造図
+
+```mermaid
+graph TD
+    subgraph SHM["QSharedMemory（OSのIPCキーで識別）"]
+        direction TB
+        H["SharedMemHeader  16B固定<br/>全体サイズ・エントリ数・各領域サイズを保持"]
+        ET["EntryHeader × N  各16B<br/>ノードキー / データ位置 / Property値バイト数 / 更新状態"]
+        DR["DataRegion  dataRegionSize B<br/>各ノードのProperty値バイト列を連続格納"]
+    end
+    H --> ET --> DR
+
+    style H fill:#e8f0fe,stroke:#1a73e8,stroke-width:2px
+    style ET fill:#fce8b2,stroke:#f6ae2d,stroke-width:2px
+    style DR fill:#d9ead3,stroke:#2f6b2f,stroke-width:2px
+```
+
+### updateState 状態遷移図
+
+```mermaid
+stateDiagram-v2
+    direction LR
+    s0: 0  None
+    s1: 1  Monitouch待ち
+    s2: 2  BACnet待ち（最高優先）
+
+    [*] --> s0 : 共有メモリ初期化
+
+    s0 --> s1 : Monitouchデバイス値変化を検出
+    s1 --> s0 : BACnet Propertyへ反映完了
+
+    s0 --> s2 : BACnet値受信 / 内部値変化を検出
+    s1 --> s2 : BACnet値受信（最高優先で上書き）
+    s2 --> s0 : Monitouchデバイスメモリへ反映完了
+```
+
+### データフロー図
+
+```mermaid
+graph TD
+    subgraph MT[Monitouchプロセス]
+        DM[デバイスメモリ]
+        SVC[デバイスメモリ監視・更新判定]
+        CRT[Monitouch側同期制御]
+    end
+
+    subgraph SM["Property値同期バッファ（共有メモリ）"]
+        ENTRY["Property値エントリ × N<br/>更新状態 0:なし / 1:Monitouch→BACnet / 2:BACnet→Monitouch"]
+    end
+
+    subgraph BE[BACnetExecutorプロセス]
+        MGR[BACnetExecutor側同期制御]
+        WRAP[BACnetライブラリI/F]
+        STK[BACnet通信処理]
+    end
+
+    ExtClient[(外部BACnetクライアント)]
+
+    DM -->|"デバイス値変化検出"| SVC
+    SVC -->|"更新通知書込指示"| CRT
+    CRT -->|"更新通知書込\n（更新状態=Monitouch→BACnet）"| ENTRY
+    ENTRY -->|"Monitouch→BACnet\n更新取得・処理済みリセット"| MGR
+    MGR -->|"BACnet Property値更新"| WRAP
+    WRAP --> STK
+    STK -->|"BACnet Write"| ExtClient
+
+    ExtClient -->|"外部BACnet WP受信"| MGR
+    WRAP -->|"BACnet内部値変化検出"| MGR
+    MGR -->|"更新通知書込\n（更新状態=BACnet→Monitouch）"| ENTRY
+    ENTRY -->|"BACnet→Monitouch\n更新取得・処理済みリセット"| CRT
+    CRT -->|"更新データ返却"| SVC
+    SVC -->|"デバイスメモリへ書込"| DM
+
+    style ENTRY fill:#fff3e0,stroke:#e65100,stroke-width:2px
+    style MT fill:#e8f4ff,stroke:#1a4d8c
+    style BE fill:#f1f8e9,stroke:#2e7d32
+    style ExtClient fill:#e8eaf6,stroke:#3949ab
+```
+
+### シーケンス図（デバイスメモリ変化→BACnet Property反映）
+
+Monitouchのデバイスメモリ値が変化した際に、BACnetExecutorがBACnet Propertyへ反映するまでの流れです。
+
+```mermaid
+sequenceDiagram
+    participant Cycle as HKC_SysCycleBacnet
+    participant Svc as HKC_BACnetService
+    participant Creator as HKC_BACnetPropertySyncCreator
+    participant SM as QSharedMemory
+    participant SyncMgr as BACnetPropertySyncManager
+    participant Wrapper as HKC_BACnetWrapperAPI
+
+    Cycle->>Svc: デバイスメモリ監視データを更新（updateMonitorData）
+    Svc->>Svc: デバイスメモリ現在値取得 monitorData更新
+    Svc->>Svc: Property値更新処理を要求・実行（reqUpdateProcess / updateProcess）
+    Svc->>Creator: 全エントリをスナップショット取得（readAllEntries）
+    Creator->>SM: セマフォ取得 全エントリ読み込み state=2を0にリセット セマフォ解放
+    SM-->>Creator: 全EntrySnapshot
+    Creator-->>Svc: QVector<EntrySnapshot>
+
+    loop state=0/1 かつデバイス値変化あり
+        Svc->>Creator: Monitouch→BACnet更新通知書込（writeMonitouchUpdate）
+        Creator->>SM: セマフォ取得 data書込 updateState=1 セマフォ解放
+    end
+
+    Note over SyncMgr: 100ms周期のexecLoop（BACnetExecutorプロセス内）
+    SyncMgr->>SM: state=1エントリを収集・0リセット（セマフォ保護）<br/>（applyPendingMonitouchUpdates）
+    SM-->>SyncMgr: state=1だったエントリのコピー
+    SyncMgr->>Wrapper: BACnet Property値を更新（applyToBACnet）
+    Wrapper->>Wrapper: Fnc_Analog_Input_Present_Value_Set など BACnet Property更新
+```
+
+### シーケンス図（外部WP受信・内部値変化→デバイスメモリ反映）
+
+外部BACnetクライアントのWriteProperty受信またはbacnet-stack内部値変化が発生した際に、Monitouchのデバイスメモリへ反映するまでの流れです。
+
+```mermaid
+sequenceDiagram
+    participant Client as 外部BACnetクライアント
+    participant App as BACnet_Application
+    participant SyncMgr as BACnetPropertySyncManager
+    participant SM as QSharedMemory
+    participant Creator as HKC_BACnetPropertySyncCreator
+    participant Svc as HKC_BACnetService
+    participant MM as memoryManager
+
+    alt 外部BACnetクライアントからのWriteProperty
+        Client->>App: WritePropertyRequest
+        App->>App: WP受信コールバック<br/>（callBackBACnetWritePropertySuccess）
+        App->>App: サーバキャッシュを更新（replaceServerCache）
+        App->>SyncMgr: BACnet→Monitouch更新通知書込（writeFromBACnet）
+    else BACnet内部値変化検出（100ms周期）
+        App->>SyncMgr: BACnet内部値変化を検出・同期（pollAndSyncBACnetValues）
+        SyncMgr->>SyncMgr: BACnet Property値取得
+        SyncMgr->>SyncMgr: 前回値と比較して変化を検出
+        SyncMgr->>SyncMgr: BACnet→Monitouch更新通知書込（writeFromBACnet）
+    end
+
+    SyncMgr->>SM: セマフォ取得 data書込 updateState=2（最高優先）セマフォ解放
+
+    Note over Creator,Svc: 次回 updateProcess() 実行時（HKC_SysCycleBacnet周期）
+    Svc->>Creator: 全エントリをスナップショット取得（readAllEntries）
+    Creator->>SM: セマフォ取得 全エントリ読み込み state=2を0にリセット セマフォ解放
+    SM-->>Creator: state=2だったEntrySnapshotを含む全エントリ
+    Creator-->>Svc: QVector<EntrySnapshot>
+
+    loop state=2 のエントリ
+        Svc->>Svc: BACnetデータ→書込バッファ変換（convertNodeDataToWriteBuffer）
+        Svc->>MM: デバイスメモリへ反映（writeMemory）
+    end
+```
+
+
+# BACnetExecutorプロセス
+
+## 機能概要
+
+BACnetExecutorプロセスは、bacnet-stackライブラリの実行を専任する独立プロセスです。  
+Monitouchメインプロセス（HKC_BACnetService）からの要求をUDP（localhost）で受信し、
+RP/WP等のBACnetコマンドを実行して結果を返却します。
+外部BACnetクライアントからのWrite要求はコールバック経由で検出し、QSharedMemoryを通じてMonitouchへ通知します。
+また周期処理ループ（`execLoop`）でMonitouchからの値更新要求（state=1）をBACnet Propertyへ反映し、
+bacnet-stackの内部値変化を検出（`pollAndSyncBACnetValues`）してMonitouchへ通知（state=2）します。
+
+コマンドライン引数 `--ethernet` / `--serial` により、Ethernet（BACnet/IP）とSerial（MS/TP）のいずれかのモードで動作します。
+引数省略時はEthernetモードとなります。EthernetモードとSerialモードは別インスタンスとして起動されます。
+
+| 項目 | 内容 |
+|---|---|
+| プロセス起動方式 | HKC_BACnetServiceがQProcessで起動。起動時に`--ethernet`または`--serial`引数を渡す |
+| プロセス停止方式 | IPC経由でプロセス停止コマンド（`CommandType_App_Stop`）を送信し自然終了を待つ。タイムアウト時はkill |
+| 孤立プロセス対策 | Monitouchが正常な停止IPCを送れずにクラッシュした際、BACnetExecutorプロセスが取り残されるケースへの対処。3段階で実現する。<br>① **起動時**（BACnetExecutor）: 自プロセスIDをPIDファイル（`%TEMP%/BACnetExecutor_ethernet.pid` または `_serial.pid`）へ書き込む<br>② **正常終了時**（BACnetExecutor）: 終了前にPIDファイルを削除する。クラッシュ時はPIDファイルが残ったままになる<br>③ **次回起動時**（Monitouchサービス）: BACnetExecutor起動前にPIDファイルの有無を確認する。存在すれば前回プロセスが孤立していると判断し、記録されたPIDをOSコマンドで強制終了（Windows: `taskkill /F /PID`、Linux: `kill -9`）してからPIDファイルを削除する |
+| Monitouchとの通信 | localhost UDP（Ethernetポート/Serialポート別）でIPCデータグラムを送受信 |
+| データシリアライズ | QDataStream（Qt_4_7）でHKC_BACnetExecutorIpcInterfaceをシリアライズ |
+| Property値同期 | QSharedMemory + QSystemSemaphoreによるプロセス間双方向同期 |
+| 使用ライブラリ | bacnet-stack（DLL: `libbacnet-stack.dll`）、HKC_BACnetWrapperAPIでラップ |
+| 周期処理間隔 | 100ms（ワンショットタイマーによる再帰的スケジューリング） |
+
+## クラス構成
+
+| 分類 | クラス/構造体 | 役割 | ファイル |
+|---|---|---|---|
+| 主体（アプリケーション） | BACnet_Application | QCoreApplicationを継承するBACnetExecutorプロセスの中核クラス。UDPソケット受信→コマンド実行→応答送信のメインループを管理。bacnet-stackライブラリのロード、コールバック登録、周期処理ループ（`execLoop`）を担う。ブロッキング（即時応答）とノンブロッキング（コールバック応答）の2種類の実行モードを持つ。 | BACnetExecutor/src/BACnet_Application.h<br>BACnetExecutor/src/BACnet_Application.cpp |
+| 制御（Property同期・Executor側） | BACnetPropertySyncManager | QSharedMemoryへのアタッチと共有メモリアタッチ・初期化（`initialize`）、外部BACnet WP受信時のBACnet値書込（`writeFromBACnet`、state=2）、Monitouch→BACnet更新反映（`applyPendingMonitouchUpdates`、state=1→BACnet）、BACnet内部値変化検出（`pollAndSyncBACnetValues`、state=2）を担う。対応するMonitouche側クラスはHKC_BACnetPropertySyncCreator。 | BACnetExecutor/src/BACnetPropertySyncManager.h<br>BACnetExecutor/src/BACnetPropertySyncManager.cpp |
+| 補助（変換ユーティリティ） | BACnet_NodeInfoConvert 名前空間 | BACNET_APPLICATION_DATA_VALUE型とQVector<quint8>の相互変換、ノードキー生成を行う関数群。WP事前準備（`preExecute`）およびRP/WP応答コールバック処理（`chkReadWritePropertyReply`）でデコードに使用する。BACnetExecutor側専用（Monitouchと共有のHKC_BACnetNodeInfoConvert名前空間とは別実装）。 | BACnetExecutor/src/BACnet_NodeInfoConvert.h<br>BACnetExecutor/src/BACnet_NodeInfoConvert.cpp |
+| 共有（ライブラリラッパ） | HKC_BACnetWrapperAPI | Monitouchプロセスと共有するbacnet-stackラッパクラス。BACnetExecutorはMonitouchと同じヘッダ・実装を参照する。bacnet-stack関数ポインタの解決とAPI呼び出しをラップ。 | V10/src/sys/service/BACnet/HKC_BACnetWrapperAPI.h<br>V10/src/sys/service/BACnet/HKC_BACnetWrapperAPI.cpp |
+| 共有（コマンド実行基底） | HKC_BACnetCommandExecutor<br>各派生クラス | Monitouchプロセスと共有するコマンド実行クラス群。IPC要求のシリアライズ/デシリアライズ、BACnet処理実行（`execute()`）を担う。CommandType別に派生クラスが存在する（ServerInitial / ServerLinkClear / ServerDeleteObject / ClientReadProperty / ClientReadMultiProperty / ClientWriteProperty / AppStop）。 | V10/src/sys/service/BACnet/HKC_BACnetCommandExecutor.h<br>V10/src/sys/service/BACnet/HKC_BACnetCommandExecutor.cpp |
+| 共有（IPC通信定義） | HKC_BACnetExecutorIpcInterface | Monitouchプロセスと共有するIPC通信データ構造。CommandType列挙体、communicationKey、paramバイト列を保持する。QDataStreamによるシリアライズに対応。UDPポート番号・PIDファイルパス・セマフォキー・共有メモリキーの取得メソッドも提供する。 | Grobal/include/System.h |
+| 共有（共有メモリレイアウト） | HKC_BACnetPropertySyncSharedMemHeader<br>HKC_BACnetPropertySyncEntryHeader<br>HKC_BACnetPropertySyncUpdateState | Monitouchプロセスと共有するQSharedMemoryのPODレイアウト定義。ヘッダ（マジック・エントリ数・領域サイズ）とエントリヘッダ（nodeKey・dataOffset・byteNum・updateState）で構成される。 | V10/src/sys/service/BACnet/HKC_BACnetPropertySyncLayout.h |
+
+## 構造図（Mermaid）
+
+### クラス構成図
+
+```mermaid
+graph TD
+    subgraph Monitouch[Monitouchプロセス]
+        Svc[HKC_BACnetService サービス中核]
+        Creator[HKC_BACnetPropertySyncCreator 共有メモリ作成側]
+    end
+    subgraph BACnetExec[BACnetExecutorプロセス]
+        App[BACnet_Application アプリ中核]
+        SyncMgr[BACnetPropertySyncManager 共有メモリ管理側]
+        NodeConv[BACnet_NodeInfoConvert 変換ユーティリティ]
+    end
+    subgraph Shared[共有クラス（両プロセスが参照）]
+        Wrapper[HKC_BACnetWrapperAPI stackラッパ]
+        CmdExec[HKC_BACnetCommandExecutor コマンド実行]
+        IpcIF[HKC_BACnetExecutorIpcInterface IPC定義]
+        SyncLayout[HKC_BACnetPropertySyncLayout 共有メモリレイアウト]
+    end
+    StackLib[(bacnet-stack ライブラリ)]
+    SharedMem[(QSharedMemory Property同期)]
+    Net[(BACnet ネットワーク)]
+
+    Svc -->|UDP送信/受信| App
+    Svc -->|作成・初期化| Creator
+    App -->|libAccess| Wrapper
+    App -->|executes| CmdExec
+    App -->|owns| SyncMgr
+    App -->|uses| NodeConv
+    Creator -->|create/write/readAll| SharedMem
+    SyncMgr -->|attach/write/poll| SharedMem
+    Wrapper -->|関数呼び出し| StackLib
+    StackLib -->|送受信| Net
+    SyncMgr -->|uses| SyncLayout
+    Creator -->|uses| SyncLayout
+
+    style App fill:#cfe2ff,stroke:#1a4d8c,stroke-width:2px
+    style SyncMgr fill:#d9ead3,stroke:#2f6b2f,stroke-width:2px
+    style NodeConv fill:#d9ead3,stroke:#2f6b2f,stroke-width:2px
+    style Wrapper fill:#ffe6b3,stroke:#b06a00,stroke-width:2px
+    style StackLib fill:#dddddd,stroke:#666,stroke-dasharray:4 3
+    style SharedMem fill:#f4cccc,stroke:#a00,stroke-dasharray:4 3
+```
+
+### シーケンス図（プロセス起動）
+
+```mermaid
+sequenceDiagram
+  participant Svc as HKC_BACnetService
+  participant Creator as HKC_BACnetPropertySyncCreator
+  participant Proc as QProcess
+  participant App as BACnet_Application
+  participant Wrap as HKC_BACnetWrapperAPI
+
+  Svc->>Creator: エントリ一覧を基に共有メモリ作成（createSharedMemory）
+  Svc->>Proc: BACnetExecutorを起動（start --ethernet/--serial）
+  Proc-->>App: プロセス起動
+
+  App->>App: UDPソケットへバインド（Ethernet/Serialポート）
+  App->>App: PIDファイルに自PIDを記録
+
+  Note over App: Monitouchからの CommandType_Server_Initial 受信待ち
+
+  Svc->>App: UDP送信 CommandType_Server_Initial（通信設定・ノード情報）
+  App->>App: 初期化データをデシリアライズ（deserialize）
+  App->>Wrap: bacnet-stack DLLをロード（loadServerLibrary）
+  App->>App: 環境変数設定・コールバック登録（initialSetting）
+  App->>Wrap: BACnetスタックを初期化（bacnet_basic_init / bacnet_read_write_init）
+  App->>App: サービス有効化・WPハンドラ差し替え（setServiceConfig）
+  App->>App: 周期処理開始・100ms間隔（timerLoop->start）
+  App-->>Svc: UDP応答 ERROR_CODE_SUCCESS
+
+  Svc->>Creator: 共有メモリをアタッチして初期化
+```
+
+### シーケンス図（RP/WP要求処理）
+
+```mermaid
+sequenceDiagram
+  participant IFBacnet as HKC_IFSysBacnet
+  participant Svc as HKC_BACnetService
+  participant App as BACnet_Application
+  participant Wrap as HKC_BACnetWrapperAPI
+  participant STK as bacnet-stack
+  participant DEV as BACnet Device
+
+  IFBacnet->>Svc: ReadProperty / WriteProperty要求
+  Svc->>Svc: IPC要求をシリアライズ<br/>（HKC_BACnetCommandExecutorClientXxx::request）
+  Svc->>App: UDP送信 CommandType_Client_ReadProperty/WriteProperty
+  Svc->>Svc: UDPレスポンス受信まで待機（loop.waitEvent）
+
+  App->>App: CommandType判定してコマンド生成（createCommandExecutor）
+  App->>App: 受信データをデシリアライズ（deserialize）
+  App->>App: WPの場合はデータ値を事前構築（preExecute）
+  App->>Wrap: RP/WP要求をキューへ投入（execute）
+  Wrap->>STK: bacnet_read_write_task経由でBACnet要求送信
+  STK->>DEV: ReadProperty / WriteProperty要求
+  DEV-->>STK: ACK（値 / ステータス）
+  STK-->>App: RP応答コールバック（callBackBACnetReadPropertyReply）
+  App->>App: 応答結果をデコード（chkReadWritePropertyReply）
+  App->>App: 後処理（postExecute）
+  App-->>Svc: UDP応答（結果データ + ステータス）
+
+  Svc->>Svc: 完了通知（eventOccurred）
+  Svc-->>IFBacnet: 応答データ返却
+```
+
+### シーケンス図（外部BACnet WP受信・Property同期）
+
+```mermaid
+sequenceDiagram
+  participant ExtClient as 外部 BACnet Client
+  participant STK as bacnet-stack
+  participant App as BACnet_Application
+  participant SyncMgr as BACnetPropertySyncManager
+  participant SharedMem as QSharedMemory
+  participant Svc as HKC_BACnetService
+
+  ExtClient->>STK: WriteProperty要求（サーバObject/Propertyへ）
+  STK->>App: WP成功コールバック（callBackBACnetWritePropertySuccess）
+  App->>App: サーバキャッシュを更新（replaceServerCache）
+  App->>App: BACnet値をデコード（BACnet_NodeInfoConvert::getUpdateValue）
+  App->>SyncMgr: BACnet→Monitouch更新通知書込（writeFromBACnet）
+  SyncMgr->>SyncMgr: セマフォ取得
+  SyncMgr->>SharedMem: dataRegion上書き + updateState=2(BACnet)に設定
+  SyncMgr->>SyncMgr: セマフォ解放
+
+  Note over Svc: 次回 updateProcess() 実行時
+  Svc->>Svc: 全エントリ取得・state=2を検出（readAllEntries）
+  Svc->>Svc: writeDevList に書込要求を追加
+  Svc->>Svc: デバイスメモリへ反映（state=2 は readAllEntries 内で 0 にリセット済み）
+```
+
+### シーケンス図（周期処理）
+
+```mermaid
+sequenceDiagram
+  participant Timer as timerLoop(100ms)
+  participant App as BACnet_Application
+  participant Wrap as HKC_BACnetWrapperAPI
+  participant STK as bacnet-stack
+  participant SyncMgr as BACnetPropertySyncManager
+  participant SharedMem as QSharedMemory
+
+  Timer->>App: タイムアウト（execLoop）
+
+  App->>Wrap: 受信パケット処理・Who-Is応答（Fnc_bacnet_basic_task）
+  App->>Wrap: RP/WP非同期タスク処理（Fnc_bacnet_read_write_task）
+
+  App->>SyncMgr: BACnet内部値変化をstate=2で共有メモリへ反映<br/>（pollAndSyncBACnetValues）
+  SyncMgr->>STK: 各ObjectのPresent_Value等を取得（getter経由）
+  SyncMgr->>SyncMgr: 前回値と比較して変化を検出
+  SyncMgr->>SharedMem: 変化エントリのdata上書き + updateState=2設定（セマフォ保護）
+
+  App->>SyncMgr: state=1エントリをBACnet Propertyへ反映<br/>（applyPendingMonitouchUpdates）
+  SyncMgr->>SharedMem: state=1 エントリを一括取得（セマフォ保護）+ updateState=0にリセット
+  SyncMgr->>Wrap: Fnc_Xxx_Present_Value_Set等でBACnetキャッシュを更新
+
+  App->>App: FD再登録タイマー処理（dlenv_maintenance_timer）
+  App->>Timer: 次回100ms後に再スケジュール（timerLoop->start）
 ```
 
 # モニタッチで対応する機能一覧
@@ -542,7 +1084,7 @@ ASHRAE 135 Annex J / Clause 9 に基づくデータリンク層の対応状況�
 
 | 文字セット | 対応 | 備考 |
 |---|---|---|
-| ISO 10646 (UTF-8) | ○ | BACnet CharacterString の標準エンコーディング |
+| ISO 10646 (UTF-8) | ○ | BACnet CharacterString の標準エンコーディング。ただし、モニタッチの文字列アイテムからUTF-8を表示、または書き込みすることができない。BLT認証を考慮する場合、上記制限も考慮する必要がある可能性がある。 |
 | ISO 8859-1 | × | |
 | IBM/Microsoft DBCS | × | |
 | ISO 10646 (UCS-2) | × | |
@@ -597,6 +1139,21 @@ ASHRAE 135 Annex J / Clause 9 に基づくデータリンク層の対応状況�
 - AO / BO の `Present_Value` 書き込みには **WriteProperty Priority** が必要です。Priority はインスタンス単位で個別に設定可能としますが、設定値は固定となり動作中の動的変更は行いません。
   - Priority 範囲: 1（最優先・Manual-Life Safety）〜 16（最低優先度）
   - 推奨: HMI が唯一の制御源の場合は Priority 1、外部クライアントとの共存が必要な場合は Priority 8 以下
+
+#### エディタ設定項目の要否（サーバ更新区分別）
+
+初期値の指定とメモリ設定がいずれも不要なサーバ更新区分は、エディタ上でユーザーが設定する情報が存在しないため、Property自体をエディタに表示しない。
+
+| サーバ更新区分 | エディタ表示 | 初期値の指定 | メモリ設定 |
+|---|---|---|---|
+| `ライブラリ固定` | しない | 不要 | 不要 |
+| `初回設定（ユーザー値）` | **する** | **必要** | 不要 |
+| `初回設定（内部固定）` | しない | 不要 | 不要 |
+| `初回設定（WP更新あり）` | **する** | **必要** | **必要** |
+| `毎スキャン書込` | **する** | 不要 | **必要** |
+| `アプリ内部更新` | しない | 不要 | 不要 |
+| `毎スキャン監視` | **する** | 不要 | **必要** |
+| `ライブラリ管理` | しない | 不要 | 不要 |
 
 ### 使用データ型一覧
 
@@ -840,7 +1397,7 @@ ASHRAE 135-2024 Table 12-4 に基づくモニタッチ対応プロパティ。
 | Present_Value | アナログ出力の現在値（工学単位）。BACnetコマンド優先制御に従う | 85 | Required | RW | REAL | `BACNET_APPLICATION_TAG_REAL` | 毎スキャン書込 |
 | Description | 内容が制限されない任意の印刷可能文字列 | 28 | Optional | R | CharacterString | `BACNET_APPLICATION_TAG_CHARACTER_STRING` | 初回設定（ユーザー値） |
 | Status_Flags | オブジェクトの健全性を示す4ビットフラグ（IN_ALARM / FAULT / OVERRIDDEN / OUT_OF_SERVICE） | 111 | Required | R | BACnetStatusFlags (BIT STRING) | `BACNET_APPLICATION_TAG_BIT_STRING` | 毎スキャン監視 |
-| Event_State | 現在のイベント状態。イベント報告非対応時はNORMAL | 36 | Required | R | BACnetEventState (ENUMERATED) | `BACNET_APPLICATION_TAG_ENUMERATED` | 毎スキャン監視 |
+| Event_State | 現在のイベント状態。イベント報告非対応時はNORMAL | 36 | Required | R | BACnetEventState (ENUMERATED) | `BACNET_APPLICATION_TAG_ENUMERATED` | ライブラリ固定 |
 | Reliability | Present_Valueまたは物理出力の信頼性の表示 | 103 | Optional | R | BACnetReliability (ENUMERATED) | `BACNET_APPLICATION_TAG_ENUMERATED` | アプリ内部更新 |
 | Out_Of_Service | TRUEのとき物理出力とPresent_Valueが切り離される | 81 | Required | RW | BOOLEAN | `BACNET_APPLICATION_TAG_BOOLEAN` | 毎スキャン書込 |
 | Units | Present_Valueの工学単位 | 117 | Required | RW | BACnetEngineeringUnits (ENUMERATED) | `BACNET_APPLICATION_TAG_ENUMERATED` | 初回設定（WP更新あり） |
@@ -857,6 +1414,8 @@ ASHRAE 135-2024 Table 12-4 に基づくモニタッチ対応プロパティ。
 > - `priority` パラメータはWP時に使用する
 
 > `Status_Flags` の各ビット定義は [BACnetStatusFlags](#bacnetstatusflags) を参照。
+
+> `Event_State` は bacnet-stack ライブラリ（`ao.c` の ReadProperty ハンドラ）で `EVENT_STATE_NORMAL` に**ハードコード**されており、専用 getter・内部更新機能ともに存在しない。AO では Intrinsic Reporting が未実装であるため、値は常に NORMAL 固定となり、`Status_Flags` の `IN_ALARM` ビットも常に `false` となる。このため `pollAndSyncBACnetValues` での監視対象から除外する。
 
 ---
 
@@ -898,7 +1457,7 @@ ASHRAE 135-2024 Table 12-8 に基づくモニタッチ対応プロパティ。
 | Present_Value | バイナリ出力の論理状態（INACTIVE / ACTIVE）。BACnetコマンド優先制御に従う | 85 | Required | RW | BACnetBinaryPV (ENUMERATED: INACTIVE=0 / ACTIVE=1) | `BACNET_APPLICATION_TAG_ENUMERATED` | 毎スキャン書込 |
 | Description | 内容が制限されない任意の印刷可能文字列 | 28 | Optional | R | CharacterString | `BACNET_APPLICATION_TAG_CHARACTER_STRING` | 初回設定（ユーザー値） |
 | Status_Flags | オブジェクトの健全性を示す4ビットフラグ（IN_ALARM / FAULT / OVERRIDDEN / OUT_OF_SERVICE） | 111 | Required | R | BACnetStatusFlags (BIT STRING) | `BACNET_APPLICATION_TAG_BIT_STRING` | 毎スキャン監視 |
-| Event_State | 現在のイベント状態。イベント報告非対応時はNORMAL | 36 | Required | R | BACnetEventState (ENUMERATED) | `BACNET_APPLICATION_TAG_ENUMERATED` | 毎スキャン監視 |
+| Event_State | 現在のイベント状態。イベント報告非対応時はNORMAL | 36 | Required | R | BACnetEventState (ENUMERATED) | `BACNET_APPLICATION_TAG_ENUMERATED` | ライブラリ固定 |
 | Reliability | Present_Valueまたは物理出力の信頼性の表示 | 103 | Optional | R | BACnetReliability (ENUMERATED) | `BACNET_APPLICATION_TAG_ENUMERATED` | アプリ内部更新 |
 | Out_Of_Service | TRUEのとき物理出力とPresent_Valueが切り離される | 81 | Required | RW | BOOLEAN | `BACNET_APPLICATION_TAG_BOOLEAN` | 毎スキャン書込 |
 | Polarity | 物理出力状態と論理状態の対応関係（NORMAL：小真対応 / REVERSE：反転） | 90 | Required | RW | BACnetPolarity (ENUMERATED: NORMAL=0 / REVERSE=1) | `BACNET_APPLICATION_TAG_ENUMERATED` | 初回設定（WP更新あり） |
@@ -914,6 +1473,8 @@ ASHRAE 135-2024 Table 12-8 に基づくモニタッチ対応プロパティ。
 > - `priority` パラメータはWP時に使用する
 
 > `Status_Flags` の各ビット定義は [BACnetStatusFlags](#bacnetstatusflags) を参照。
+
+> `Event_State` は bacnet-stack ライブラリ（`bo.c` の ReadProperty ハンドラ）で `EVENT_STATE_NORMAL` に**ハードコード**されており、専用 getter・内部更新機能ともに存在しない。BO では Intrinsic Reporting が未実装であるため、値は常に NORMAL 固定となり、`Status_Flags` の `IN_ALARM` ビットも常に `false` となる。このため `pollAndSyncBACnetValues` での監視対象から除外する。
 
 ---
 
@@ -948,6 +1509,11 @@ ASHRAE 135-2024 Table 12-11 に基づくモニタッチ対応プロパティ。
 > `Protocol_Services_Supported` の各ビット定義は [BACnetServicesSupported](#bacnetservicessupported) を参照。
 
 > `Protocol_Object_Types_Supported` の各ビット定義は [BACnetObjectTypesSupported](#bacnetobjecttypessupported) を参照。
+
+> **セグメンテーションについて**
+> bacnet-stack は `Segmentation_Supported` が **`SEGMENTATION_NONE`（セグメンテーション非対応）** にハードコードされている（`Device_Segmentation_Supported()` 参照）。
+> セグメント化されたリクエストを受信した場合は `ERROR_CODE_ABORT_SEGMENTATION_NOT_SUPPORTED` を返す。
+> このため、1回のリード/ライトで扱えるデータの上限は **`Max_APDU_Length_Accepted` の最大値（1476バイト）** となり、リスト型可変データを含む全データを1476バイト以内に収める必要がある。
 
 ---
 
@@ -1076,12 +1642,16 @@ ASHRAE 135-2024 Table 12-71.6 の順序に基づく。
 | Link_Speed | シリアル通信ボーレート（bps）。WP受付可だが実際の通信速度は変化しない | 420 | Optional（PR≥24） | RW | REAL（bps） | `BACNET_APPLICATION_TAG_REAL` | 初回設定（WP更新あり） |
 | Link_Speeds | サポートするボーレートの一覧（読み取り専用配列） | 421 | Optional（PR≥24） | R | BACnetARRAY[N] of REAL（bps） | `BACNET_APPLICATION_TAG_REAL` | ライブラリ固定 |
 | Max_Manager | MS/TPネットワーク上のマネージャノードの最大アドレス番号（0〜127） | 64 | Optional ※3 | RW | Unsigned（0〜127） | `BACNET_APPLICATION_TAG_UNSIGNED_INT` | 初回設定（WP更新あり） |
-| Max_Info_Frames | トークン保持中に送信できる最大フレーム数 | 63 | Optional ※3 | RW | Unsigned | `BACNET_APPLICATION_TAG_UNSIGNED_INT` | 初回設定（WP更新あり） |
+| Max_Info_Frames | トークン保持中に送信できる最大フレーム数 | 63 | Optional ※3 | RW | Unsigned（1〜8）※4 | `BACNET_APPLICATION_TAG_UNSIGNED_INT` | 初回設定（WP更新あり） |
 
 > ※3 MSTP マネージャノードの場合のみ Required（ASHRAE 135-2024 Clause 12.56.55 / 12.56.56）。モニタッチは常にマネージャノードとして動作するため実装必須。  
 > MS/TP のステーションアドレス（0〜127）は `MAC_Address`（1バイト OCTET STRING）として表現される。  
 > `Link_Speed` は有効なボーレート値（9600 / 19200 / 38400 / 57600 / 76800 / 115200 bps）の WP を受け付けるが、**実際のシリアル通信速度は変化しない**。  
-> `Link_Speeds` は bacnet-stack がサポートするボーレートの一覧を固定配列（`{ 9600, 19200, 38400, 57600, 76800, 115200 }`）として返す。
+> `Link_Speeds` は bacnet-stack がサポートするボーレートの一覧を固定配列（`{ 9600, 19200, 38400, 57600, 76800, 115200 }`）として返す。  
+> ※4 `Max_Info_Frames` の書き込み可能範囲は **1〜8** に制限される（**BTL 認証 PICS の申告値も 1〜8 とすること**）。  
+> BACnet 規格上の有効値は 1〜255 だが、bacnet-stack の PDU 送信キュー（`MSTP_PDU_PACKET_COUNT = 8`）が 2の累乗サイズの固定リングバッファとして実装されており、9 以上は動作できない。  
+> 9 以上の値を WriteProperty で指定した場合、`device.c` および `netport.c` は `ERROR_CLASS_PROPERTY / ERROR_CODE_VALUE_OUT_OF_RANGE` を返す。  
+> 上限値は `dlmstp_max_info_frames_limit()` 関数（`ports/win32/dlmstp.c`、`ports/linux/dlmstp.c`）が `MSTP_PDU_PACKET_COUNT` を返すことで動的に取得できる。
 
 #### MS/TP シリアル通信パラメータ（固定値）
 
@@ -1119,6 +1689,7 @@ BACnet/MS/TP のシリアル通信パラメータは以下の値に固定であ�
 | NP (BIP) | IP_Subnet_Mask | 411 | W（DHCP無効時） | `WRITE_ACCESS_DENIED` | `netport.c` |
 | NP (BIP) | IP_Default_Gateway | 401 | W（DHCP無効時） | `WRITE_ACCESS_DENIED` | `netport.c` |
 | NP (BIP) | IP_DNS_Server | 406 | W（DHCP無効時） | `WRITE_ACCESS_DENIED` | `netport.c` |
+| NP (MSTP) | Max_Info_Frames | 63 | W（1〜255） | WP受付範囲は 1〜8（PDU送信キュー `MSTP_PDU_PACKET_COUNT=8` の物理上限）→ 9 以上は `VALUE_OUT_OF_RANGE` | `device.c`, `netport.c` |
 
 > AI/AO/BI/BO・NP の `WRITE_ACCESS_DENIED` は `Write_Property` 内に対応 `case` がないことによる。  
 > Device の `System_Status`・`Model_Name` は bacnet-stack がWPを受け付けるが、モニタッチとして外部からの変更を不可とする設計方針による。  
@@ -1178,10 +1749,9 @@ BACnet/MS/TP のシリアル通信パラメータは以下の値に固定であ�
 > 出力データの形式はプロパティによって異なる。ユーザーは最大出力バイト数に十分な領域を確保した上で本マクロを呼び出すこと。
 
 > [!NOTE]
-> **T.B.D. — クライアント機能によるリスト型プロパティのリード**  
-> モニタッチがBACnetクライアントとして、リモート機器のリスト型プロパティ（`BACnetLIST`）を読み取る場合は、通常のクライアント読み取り機能（8WAY通信経由・デバイスメモリ固定割り当て）では対応できないため、専用の読み取りマクロでの対応が必要と考えられる。  
-> リスト型プロパティは要素数が相手デバイスの状態により可変であり、プロジェクト作成時に確定したバイト数割り当てと整合しないためである。  
-> **現時点では未決定。** ユーザーがリスト型プロパティのデータをクライアント側から読み取る必要があるか否かが確認されていないため、実装要否の判断を保留している。
+> **クライアント機能によるリスト型プロパティのリード**  
+> モニタッチがBACnetクライアントとして、リモート機器のリスト型プロパティ（`BACnetLIST`）を読み取る場合は、通常のクライアント読み取り機能（8WAY通信経由）で対応する。全データを一括取得し、ユーザーが指定したインデックスの要素をデバイスメモリへ格納する。指定インデックスの要素が存在しない場合はエラーを返す。  
+> 全データのリードや要素の追加・削除が必要な場合は、専用マクロでの対応が必要となる。
 
 ---
 
@@ -1291,8 +1861,134 @@ bacnet-stack 内部関数を直接呼び出し、コマンダブルプロパテ�
 - 非コマンダブルプロパティに対して NULL を書き込んだ場合はエラーが返ることがある（機器依存）
 
 > [!NOTE]
-> **T.B.D. — クライアント機能によるリスト型プロパティのライト**  
-> モニタッチがBACnetクライアントとして、リモート機器のリスト型プロパティ（`BACnetLIST`）に書き込む場合は、通常のクライアント書き込み機能（8WAY通信経由・デバイスメモリ固定割り当て）では対応できないため、専用の書き込みマクロでの対応が必要と考えられる。  
-> リスト型プロパティへの書き込みは全体の一括置換となり（インデックス単位の書き込みは規格上不可）、要素追加・削除は `AddListElement` / `RemoveListElement` サービスの利用が必要となるため、固定バイト数の割り当てとは設計上相容れないためである。  
-> **現時点では未決定。** ユーザーがリスト型プロパティのデータをクライアント側から書き込む必要があるか否かが確認されていないため、実装要否の判断を保留している。
+> **クライアント機能によるリスト型プロパティのライト**  
+> モニタッチがBACnetクライアントとして、リモート機器のリスト型プロパティ（`BACnetLIST`）に書き込む場合は、通常のクライアント書き込み機能（8WAY通信経由）で対応する。Read-Modify-Write 方式により、まず全データをリードして内部に保持し、ユーザーが指定したインデックスの要素のみを変更した上で全体をライトする。指定インデックスの要素が存在しない場合はエラーを返す。要素の追加・削除には対応しない。  
+> 全データのライトや要素の追加・削除が必要な場合は、専用マクロでの対応が必要となる。
+
+---
+
+# Appendix: bacnet-stack Setter/Getter リファレンス
+
+`pollAndSyncBACnetValues`（ライブラリ内部更新値の監視）および `applyToBACnet`（Monitouch → BACnet書き込み）実装時の参照用。  
+bacnet-stack V1.4.2 の `src/bacnet/basic/object/` 以下を調査した結果。
+
+**凡例**
+- **①** `pollAndSyncBACnetValues` 対象：ライブラリが内部で自動更新するプロパティ
+- **②** `applyToBACnet` 対象：Monitouchデバイスメモリ → ライブラリへ書き込むプロパティ
+- **合成値**：専用getter不在。`ReadProperty` ハンドラ内で構成要素から動的合成される
+
+---
+
+## AI（Analog Input）
+
+| プロパティ | サーバ更新区分 | Getter | Setter | ライブラリ内部更新 | 備考 |
+|---|---|---|---|---|---|
+| `Present_Value` | 毎スキャン書込 | `Analog_Input_Present_Value()` | `Analog_Input_Present_Value_Set()` | なし | ② |
+| `Status_Flags` | 毎スキャン監視 | なし（合成値） | なし | あり（合成） | `Event_State`・`Out_Of_Service`・`Reliability` から動的合成 |
+| `Event_State` | 毎スキャン監視 | `Analog_Input_Event_State()` | `Analog_Input_Event_State_Set()` | あり（`INTRINSIC_REPORTING` 有効時） | ① 閾値超過時にライブラリが自動更新 |
+| `Out_Of_Service` | 毎スキャン書込 | `Analog_Input_Out_Of_Service()` | `Analog_Input_Out_Of_Service_Set()` | なし | ② |
+| `Units` | 初回設定（WP更新あり） | `Analog_Input_Units()` | `Analog_Input_Units_Set()` | なし | — |
+| `COV_Increment` | 初回設定（WP更新あり） | `Analog_Input_COV_Increment()` | `Analog_Input_COV_Increment_Set()` | なし | — |
+
+---
+
+## AO（Analog Output）
+
+| プロパティ | サーバ更新区分 | Getter | Setter | ライブラリ内部更新 | 備考 |
+|---|---|---|---|---|---|
+| `Present_Value` | 毎スキャン書込 | `Analog_Output_Present_Value()` | `Analog_Output_Present_Value_Set()` | なし | ② |
+| `Status_Flags` | 毎スキャン監視 | なし（合成値） | なし | あり（合成） | `Out_Of_Service`・`Reliability` から動的合成（`IN_ALARM` は常に false） |
+| `Event_State` | ライブラリ固定 | なし | なし | なし | `ao.c` の ReadProperty で `EVENT_STATE_NORMAL` にハードコード |
+| `Out_Of_Service` | 毎スキャン書込 | `Analog_Output_Out_Of_Service()` | `Analog_Output_Out_Of_Service_Set()` | なし | ② |
+| `Units` | 初回設定（WP更新あり） | `Analog_Output_Units()` | `Analog_Output_Units_Set()` | なし | — |
+| `Min_Pres_Value` | 初回設定（WP更新あり） | `Analog_Output_Min_Pres_Value()` | `Analog_Output_Min_Pres_Value_Set()` | なし | — |
+| `Max_Pres_Value` | 初回設定（WP更新あり） | `Analog_Output_Max_Pres_Value()` | `Analog_Output_Max_Pres_Value_Set()` | なし | — |
+| `COV_Increment` | 初回設定（WP更新あり） | `Analog_Output_COV_Increment()` | `Analog_Output_COV_Increment_Set()` | なし | — |
+| `Current_Command_Priority` | 毎スキャン監視 | `Analog_Output_Present_Value_Priority()` | なし（ライブラリが自動算出） | あり | ① WP/Relinquish受信で Priority Array が変化した際にライブラリが自動更新 |
+
+---
+
+## BI（Binary Input）
+
+| プロパティ | サーバ更新区分 | Getter | Setter | ライブラリ内部更新 | 備考 |
+|---|---|---|---|---|---|
+| `Present_Value` | 毎スキャン書込 | `Binary_Input_Present_Value()` | `Binary_Input_Present_Value_Set()` | なし | ② |
+| `Status_Flags` | 毎スキャン監視 | なし（合成値） | なし | あり（合成） | `Event_State`・`Out_Of_Service`・`Reliability` から動的合成 |
+| `Event_State` | 毎スキャン監視 | `Binary_Input_Event_State()` | なし（`INTRINSIC_REPORTING` 側が更新） | あり（`INTRINSIC_REPORTING` 有効時） | ① |
+| `Out_Of_Service` | 毎スキャン書込 | `Binary_Input_Out_Of_Service()` | `Binary_Input_Out_Of_Service_Set()` | なし | ② |
+| `Polarity` | 初回設定（WP更新あり） | `Binary_Input_Polarity()` | `Binary_Input_Polarity_Set()` | なし | — |
+
+---
+
+## BO（Binary Output）
+
+| プロパティ | サーバ更新区分 | Getter | Setter | ライブラリ内部更新 | 備考 |
+|---|---|---|---|---|---|
+| `Present_Value` | 毎スキャン書込 | `Binary_Output_Present_Value()` | `Binary_Output_Present_Value_Set()` | なし | ② |
+| `Status_Flags` | 毎スキャン監視 | なし（合成値） | なし | あり（合成） | `Out_Of_Service`・`Reliability` から動的合成（`IN_ALARM` は常に false） |
+| `Event_State` | ライブラリ固定 | なし | なし | なし | `bo.c` の ReadProperty で `EVENT_STATE_NORMAL` にハードコード |
+| `Out_Of_Service` | 毎スキャン書込 | `Binary_Output_Out_Of_Service()` | `Binary_Output_Out_Of_Service_Set()` | なし | ② |
+| `Polarity` | 初回設定（WP更新あり） | `Binary_Output_Polarity()` | `Binary_Output_Polarity_Set()` | なし | — |
+| `Relinquish_Default` | 初回設定（WP更新あり） | `Binary_Output_Relinquish_Default()` | `Binary_Output_Relinquish_Default_Set()` | なし | — |
+| `Current_Command_Priority` | 毎スキャン監視 | `Binary_Output_Present_Value_Priority()` | なし（ライブラリが自動算出） | あり | ① AO と同様 |
+
+---
+
+## Device
+
+| プロパティ | サーバ更新区分 | Getter | Setter | ライブラリ内部更新 | 備考 |
+|---|---|---|---|---|---|
+| `System_Status` | 毎スキャン書込 | `Device_System_Status()` | `Device_Set_System_Status()` | なし | ② |
+| `Object_Name` | 初回設定（WP更新あり） | `Device_Object_Name()` | `Device_Set_Object_Name()` | WP受信時に `Device_Inc_Database_Revision()` を自動呼び出し | WP後に `Database_Revision` も連動更新される |
+| `APDU_Timeout` | 初回設定（WP更新あり） | `apdu_timeout()`（`h_apdu.h`） | `apdu_timeout_set()` | なし | — |
+| `Number_Of_APDU_Retries` | 初回設定（WP更新あり） | `apdu_retries()`（`h_apdu.h`） | `apdu_retries_set()` | なし | — |
+| `Database_Revision` | 毎スキャン監視 | `Device_Database_Revision()` | `Device_Set_Database_Revision()` / `Device_Inc_Database_Revision()` | あり | ① Object_Name変更・オブジェクト追加削除・WP受信時などに自動インクリメント |
+
+---
+
+## NP（Network Port）
+
+**共通プロパティ（BIP / MSTP 両方）**
+
+| プロパティ | サーバ更新区分 | Getter | Setter | ライブラリ内部更新 | 備考 |
+|---|---|---|---|---|---|
+| `Status_Flags` | 毎スキャン監視 | なし（合成値） | なし | あり（合成） | `Reliability`・`Out_Of_Service` から動的合成（`IN_ALARM` は常に false） |
+| `Changes_Pending` | 毎スキャン監視 | `Network_Port_Changes_Pending()` | `Network_Port_Changes_Pending_Set()` | あり | ① WP受信時にライブラリが自動で `true` にセット |
+
+**BIP 固有プロパティ**
+
+| プロパティ | サーバ更新区分 | Getter | Setter | ライブラリ内部更新 | 備考 |
+|---|---|---|---|---|---|
+| `BBMD_Accept_FD_Registrations` | 初回設定（WP更新あり） | `Network_Port_BBMD_Accept_FD_Registrations()` | `Network_Port_BBMD_Accept_FD_Registrations_Set()` | なし | — |
+| `FD_BBMD_Address` | 初回設定（WP更新あり） | `Network_Port_Remote_BBMD_Address()` | `Network_Port_Remote_BBMD_Address_Set()` | なし | `BACNET_HOST_N_PORT` 型 |
+| `FD_Subscription_Lifetime` | 初回設定（WP更新あり） | `Network_Port_Remote_BBMD_BIP_Lifetime()` | `Network_Port_Remote_BBMD_BIP_Lifetime_Set()` | なし | — |
+
+**MSTP 固有プロパティ**
+
+| プロパティ | サーバ更新区分 | Getter | Setter | ライブラリ内部更新 | 備考 |
+|---|---|---|---|---|---|
+| `MAC_Address` | 初回設定（WP更新あり） | `Network_Port_MSTP_MAC_Address()` | `Network_Port_MSTP_MAC_Address_Set()` | なし | `uint8_t`、範囲 0〜127 |
+| `Link_Speed` | 初回設定（WP更新あり） | `Network_Port_Link_Speed()` | `Network_Port_Link_Speed_Set()` | なし | — |
+| `Max_Manager` | 初回設定（WP更新あり） | `Network_Port_MSTP_Max_Master()` | `Network_Port_MSTP_Max_Master_Set()` | なし | — |
+| `Max_Info_Frames` | 初回設定（WP更新あり） | `Network_Port_MSTP_Max_Info_Frames()` | `Network_Port_MSTP_Max_Info_Frames_Set()` | なし | — |
+
+---
+
+## ①pollAndSyncBACnetValues 対象まとめ
+
+| Object Type | プロパティ | Getter | 更新タイミング |
+|---|---|---|---|
+| AI | `Event_State` | `Analog_Input_Event_State()` | INTRINSIC_REPORTING有効時、Present_Value閾値超過 |
+| AO | `Current_Command_Priority` | `Analog_Output_Present_Value_Priority()` | WP / Relinquish受信で Priority Array 変化 |
+| BI | `Event_State` | `Binary_Input_Event_State()` | INTRINSIC_REPORTING有効時 |
+| BO | `Current_Command_Priority` | `Binary_Output_Present_Value_Priority()` | WP / Relinquish受信で Priority Array 変化 |
+| Device | `Database_Revision` | `Device_Database_Revision()` | オブジェクト変更・WP受信時に自動インクリメント |
+| NP | `Changes_Pending` | `Network_Port_Changes_Pending()` | WP受信時に自動で `true` にセット |
+
+## Status_Flags の取得方針
+
+全 Object Type（AI / AO / BI / BO / NP）において、`Status_Flags` の専用 getter は存在しない。`ReadProperty` ハンドラ内で構成要素から動的合成されるため、`pollAndSyncBACnetValues` での変化検出には以下のいずれかの方法が必要。
+
+- **推奨**：構成要素（`Event_State`、`Out_Of_Service`、`Reliability`）の個別 getter を呼び出し、アプリ側でビット列を組み立てて前回値と比較する
+- 代替：`xxx_Read_Property()` を `PROP_STATUS_FLAGS` で呼び出し、APDUバッファをデコードする（処理コスト高）
 
