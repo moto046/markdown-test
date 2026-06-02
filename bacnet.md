@@ -93,43 +93,60 @@ bacnet-stackライブラリの実行はBACnetExecutorプロセスが専任し、
 BACnetExecutorプロセスはEthernet（BACnet/IP）用とSerial（BACnet/MSTP）用の2インスタンスが存在します。
 
 ```mermaid
-graph TD
-    subgraph MT[Monitouchメインプロセス]
-        IF[HKC_IFSysBACnet クライアントI/F]
-        SvcE[HKC_BACnetServiceEthernet]
-        SvcS[HKC_BACnetServiceSerial]
-    end
+graph TD;
+  P1["① サーバ機能(Ethernet)"];
+  P2["② サーバ機能(Serial)"];
+  P3["③ クライアント機能(Ethernet)"];
+  P4["④ クライアント機能(Serial)"];
 
-    subgraph EE[BACnetExecutorプロセス Ethernet]
-        AE[BACnet_Application]
-    end
+  subgraph MT[Monitouchメインプロセス];
+  CE[HKC_IFSysBACnetEthernet クライアントI/F];
+  CS[HKC_IFSysBACnetSerial クライアントI/F];
+    SvcE[HKC_BACnetServiceEthernet];
+    SvcS[HKC_BACnetServiceSerial];
+  end;
 
-    subgraph ES[BACnetExecutorプロセス Serial]
-        AS[BACnet_Application]
-    end
+  subgraph EE[BACnetExecutorプロセス Ethernet];
+    AE[BACnet_Application];
+  end;
 
-    SME[(QSharedMemory Ethernet用)]
-    SMS[(QSharedMemory Serial用)]
-    ExtE[(外部BACnet IP機器)]
-    ExtS[(外部BACnet MSTP機器)]
+  subgraph ES[BACnetExecutorプロセス Serial];
+    AS[BACnet_Application];
+  end;
 
-    IF --> SvcE
-    IF --> SvcS
-    SvcE <-->|"IPC-A  UDP コマンド制御"| AE
-    SvcS <-->|"IPC-A  UDP コマンド制御"| AS
-    SvcE <-->|"IPC-B  Property値同期"| SME
-    AE <-->|"IPC-B  Property値同期"| SME
-    SvcS <-->|"IPC-B  Property値同期"| SMS
-    AS <-->|"IPC-B  Property値同期"| SMS
-    AE <-->|"BACnet/IP"| ExtE
-    AS <-->|"BACnet/MSTP"| ExtS
+  SME[(QSharedMemory Ethernet用)];
+  SMS[(QSharedMemory Serial用)];
+  ExtE[(外部BACnet IP機器)];
+  ExtS[(外部BACnet MSTP機器)];
 
-    style MT fill:#e8f4ff,stroke:#1a4d8c
-    style EE fill:#f1f8e9,stroke:#2e7d32
-    style ES fill:#f1f8e9,stroke:#2e7d32
-    style SME fill:#fff3e0,stroke:#e65100
-    style SMS fill:#fff3e0,stroke:#e65100
+  P1 --> SvcE;
+  P2 --> SvcS;
+  P3 --> CE --> SvcE;
+  P4 --> CS --> SvcS;
+  SvcE <-->|"IPC-A  UDP コマンド制御"| AE;
+  SvcS <-->|"IPC-A  UDP コマンド制御"| AS;
+  SvcE <-->|"IPC-B  Property値同期"| SME;
+  AE <-->|"IPC-B  Property値同期"| SME;
+  SvcS <-->|"IPC-B  Property値同期"| SMS;
+  AS <-->|"IPC-B  Property値同期"| SMS;
+  AE <-->|"BACnet/IP"| ExtE;
+  AS <-->|"BACnet/MSTP"| ExtS;
+
+  style MT fill:#e8f4ff,stroke:#1a4d8c;
+  style EE fill:#f1f8e9,stroke:#2e7d32;
+  style ES fill:#f1f8e9,stroke:#2e7d32;
+  style SME fill:#fff3e0,stroke:#e65100;
+  style SMS fill:#fff3e0,stroke:#e65100;
 ```
+
+上図の①〜④が有効になる条件は以下のとおりです。
+
+| パターン | 有効条件 |
+|---|---|
+| ① サーバ機能(Ethernet) | エディタのIIoT設定で、BACnetサーバのEthernet用設定を追加した場合に有効 |
+| ② サーバ機能(Serial) | エディタのIIoT設定で、BACnetサーバのSerial用設定を追加した場合に有効 |
+| ③ クライアント機能(Ethernet) | エディタのPLC8Way設定で、BACnetクライアントのEthernetドライバを追加した場合に有効 |
+| ④ クライアント機能(Serial) | エディタのPLC8Way設定で、BACnetクライアントのSerialドライバを追加した場合に有効 |
 
 ## IPC種別と使い分け
 
@@ -336,6 +353,8 @@ bacnet-stackライブラリの実行はBACnetExecutorプロセスが専任し、
 サーバ動作はサービススレッド`HKC_BACnetService`で管理され、システム周期処理`HKC_SysCycleBacnet`から周期的な監視メモリ取得（`getMemoryOrder`）/メモリ状態確認（`chkMemStat`）とデバイスメモリ監視更新（`updateMonitorData`）の呼び出しが行われます。  
 デバイスメモリ監視更新（`updateMonitorData`）はデバイスメモリの現在値を取得して`monitorData`を更新し、更新処理要求（`reqUpdateProcess`）→更新実行（`updateProcess`）を呼び出します。  
 `updateProcess`ではQSharedMemory経由でBACnetExecutorとProperty値を双方向に同期します（詳細: → [Property同期メカニズム（QSharedMemory）](#property同期メカニズムqsharedmemory) 参照）。
+
+エディタ側で設定された各Propertyに対応する内部メモリ/PLCメモリのアクセス方式は、数値アクセスをDEC固定、文字列アクセスをLSB→MSB固定とします。
 
 | 項目 | 内容 |
 |---|---|
