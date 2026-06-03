@@ -1896,72 +1896,135 @@ bacnet-stack V1.4.2 の `src/bacnet/basic/object/` 以下を調査した結果�
 - **②** `applyToBACnet` 対象：Monitouchデバイスメモリ → ライブラリへ書き込むプロパティ
 - **合成値**：専用getter不在。`ReadProperty` ハンドラ内で構成要素から動的合成される
 
+## Setter反映方式（実装確認済み）
+
+Setter の戻り値が成功でも、対象機能への反映タイミングは一律ではない。実装上は以下の6系統に分かれる。
+
+| 区分 | 反映方式 | 代表プロパティ / Setter | 実反映トリガ |
+|---|---|---|---|
+| A | 内部値更新のみ | 各 Object の `Name_Set` / `Description_Set` / `Units_Set` など | Setter 呼び出し直後にライブラリ内部値へ反映。`Changed` / `Change_Of_Value` / `Database_Revision` / `Changes_Pending` / callback 呼び出し等の副作用は持たない |
+| B | 条件付きで外部反映（コールバック） | AO/BO の `Present_Value_Set`（Priority 指定） | WriteProperty 経路で `Out_Of_Service=false` かつコールバック登録済みの場合に実行 |
+| C | 変更保留 → Activate で適用 | NP の WP対象 Setter 群（`FD_BBMD_Address_Set`、`FD_Subscription_Lifetime_Set`、`MSTP_Max_Master_Set` 等） | `Changes_Pending=true` 後に `Network_Port_Changes_Activate()`、または `ReinitializeDevice(activate-changes / warm-start)` |
+| D | Property値のみ更新（通信実体は未反映） | NP(BIP) の `IP_Address_Set` / `MAC_Address_Set` / `IP_Gateway_Set` など | ReadProperty で返る値は更新されるが、BIPソケットの bind 先IP等は変更されない（再初期化等の別処理が必要） |
+| E | Property値更新 + `Changes_Pending` 設定（実反映処理は未接続/未確認） | NP(BIP) の `BACnet_IP_Mode_Set` / `BACnet_IP_UDP_Port_Set` / `IP_DHCP_Enable_Set` / `IP_DNS_Server_Set` など | `Changes_Pending=true` にはなるが、現行BIP Activateコールバックでは通信実体への適用を確認できない |
+| F | 内部値更新 + ライブラリ管理副作用 | AI/BI の `Present_Value_Set`、Device の `Object_Name_Set` など | `Changed` / `Change_Of_Value` / `Database_Revision` 更新、discard callback などライブラリ内部状態に影響する |
+
+> Device の `Object_Name_Set` は内部値更新に加えて `Database_Revision` をインクリメントする。  
+> ただし通信スタック再設定のような外部機能適用は別トリガで行う。
+
 ---
 
 ## AI（Analog Input）
 
-| プロパティ | サーバ更新区分 | Getter | Setter | ライブラリ内部更新 | 備考 |
-|---|---|---|---|---|---|
-| `Present_Value` | 毎スキャン書込 | `Analog_Input_Present_Value()` | `Analog_Input_Present_Value_Set()` | なし | ② |
-| `Status_Flags` | 毎スキャン監視 | なし（合成値） | なし | あり（合成） | `Event_State`・`Out_Of_Service`・`Reliability` から動的合成 |
-| `Event_State` | 毎スキャン監視 | `Analog_Input_Event_State()` | `Analog_Input_Event_State_Set()` | あり（`INTRINSIC_REPORTING` 有効時） | ① 閾値超過時にライブラリが自動更新 |
-| `Out_Of_Service` | 毎スキャン書込 | `Analog_Input_Out_Of_Service()` | `Analog_Input_Out_Of_Service_Set()` | なし | ② |
-| `Units` | 初回設定（WP更新あり） | `Analog_Input_Units()` | `Analog_Input_Units_Set()` | なし | — |
-| `COV_Increment` | 初回設定（WP更新あり） | `Analog_Input_COV_Increment()` | `Analog_Input_COV_Increment_Set()` | なし | — |
+| プロパティ | Getter I/F | Setter I/F | 区分 | 備考 |
+|---|---|---|---|---|
+| `Object_Identifier` | なし（インスタンス参照系のみ: `Analog_Input_Index_To_Instance()` など） | なし（インスタンス生成時に設定） | — | Property Getter/Setter は未提供 |
+| `Object_Name` | `Analog_Input_Object_Name()` / `Analog_Input_Name_ASCII()` | `Analog_Input_Name_Set()` | A |  |
+| `Object_Type` | なし | なし | — | 固定値を ReadProperty で返す |
+| `Present_Value` | `Analog_Input_Present_Value()` | `Analog_Input_Present_Value_Set()` | F | COV検出により `Changed` を更新 |
+| `Description` | `Analog_Input_Description()` | `Analog_Input_Description_Set()` | A |  |
+| `Status_Flags` | なし（合成値） | なし | — | ReadProperty 内で構成要素から合成 |
+| `Event_State` | `Analog_Input_Event_State()` | `Analog_Input_Event_State_Set()` | A |  |
+| `Reliability` | `Analog_Input_Reliability()` | `Analog_Input_Reliability_Set()` | F | fault 状態変化時に `Changed` を更新 |
+| `Out_Of_Service` | `Analog_Input_Out_Of_Service()` | `Analog_Input_Out_Of_Service_Set()` | F | 値変化時に `Changed` を更新 |
+| `Units` | `Analog_Input_Units()` | `Analog_Input_Units_Set()` | A |  |
+| `COV_Increment` | `Analog_Input_COV_Increment()` | `Analog_Input_COV_Increment_Set()` | F | 更新後に COV 検出を再実行 |
+| `Property_List` | `Analog_Input_Property_Lists()` | なし | — | Property List 提供I/F |
 
 ---
 
 ## AO（Analog Output）
 
-| プロパティ | サーバ更新区分 | Getter | Setter | ライブラリ内部更新 | 備考 |
-|---|---|---|---|---|---|
-| `Present_Value` | 毎スキャン書込 | `Analog_Output_Present_Value()` | `Analog_Output_Present_Value_Set()` | なし | ② |
-| `Status_Flags` | 毎スキャン監視 | なし（合成値） | なし | あり（合成） | `Out_Of_Service`・`Reliability` から動的合成（`IN_ALARM` は常に false） |
-| `Event_State` | ライブラリ固定 | なし | なし | なし | `ao.c` の ReadProperty で `EVENT_STATE_NORMAL` にハードコード |
-| `Out_Of_Service` | 毎スキャン書込 | `Analog_Output_Out_Of_Service()` | `Analog_Output_Out_Of_Service_Set()` | なし | ② |
-| `Units` | 初回設定（WP更新あり） | `Analog_Output_Units()` | `Analog_Output_Units_Set()` | なし | — |
-| `Min_Pres_Value` | 初回設定（WP更新あり） | `Analog_Output_Min_Pres_Value()` | `Analog_Output_Min_Pres_Value_Set()` | なし | — |
-| `Max_Pres_Value` | 初回設定（WP更新あり） | `Analog_Output_Max_Pres_Value()` | `Analog_Output_Max_Pres_Value_Set()` | なし | — |
-| `COV_Increment` | 初回設定（WP更新あり） | `Analog_Output_COV_Increment()` | `Analog_Output_COV_Increment_Set()` | なし | — |
-| `Current_Command_Priority` | 毎スキャン監視 | `Analog_Output_Present_Value_Priority()` | なし（ライブラリが自動算出） | あり | ① WP/Relinquish受信で Priority Array が変化した際にライブラリが自動更新 |
+| プロパティ | Getter I/F | Setter I/F | 区分 | 備考 |
+|---|---|---|---|---|
+| `Object_Identifier` | なし（インスタンス参照系のみ: `Analog_Output_Index_To_Instance()` など） | なし（インスタンス生成時に設定） | — | Property Getter/Setter は未提供 |
+| `Object_Name` | `Analog_Output_Object_Name()` / `Analog_Output_Name_ASCII()` | `Analog_Output_Name_Set()` | A |  |
+| `Object_Type` | なし | なし | — | 固定値を ReadProperty で返す |
+| `Present_Value` | `Analog_Output_Present_Value()` | `Analog_Output_Present_Value_Set()` | B | Priority 指定付き Setter |
+| `Description` | `Analog_Output_Description()` | `Analog_Output_Description_Set()` | A |  |
+| `Status_Flags` | なし（合成値） | なし | — | ReadProperty 内で構成要素から合成 |
+| `Event_State` | なし | なし | — | ReadProperty で固定値返却 |
+| `Reliability` | `Analog_Output_Reliability()` | `Analog_Output_Reliability_Set()` | F | fault 状態変化時に `Changed` を更新 |
+| `Out_Of_Service` | `Analog_Output_Out_Of_Service()` | `Analog_Output_Out_Of_Service_Set()` | F | 値変化時に `Changed` を更新 |
+| `Units` | `Analog_Output_Units()` | `Analog_Output_Units_Set()` | A |  |
+| `Min_Pres_Value` | `Analog_Output_Min_Pres_Value()` | `Analog_Output_Min_Pres_Value_Set()` | A |  |
+| `Max_Pres_Value` | `Analog_Output_Max_Pres_Value()` | `Analog_Output_Max_Pres_Value_Set()` | A |  |
+| `COV_Increment` | `Analog_Output_COV_Increment()` | `Analog_Output_COV_Increment_Set()` | A |  |
+| `Priority_Array` | `Analog_Output_Priority_Array_Value()` / `Analog_Output_Priority_Array_Relinquished()` | なし（直接Setterなし） | — | 要素参照I/Fのみ |
+| `Relinquish_Default` | `Analog_Output_Relinquish_Default()` | `Analog_Output_Relinquish_Default_Set()` | A |  |
+| `Current_Command_Priority` | `Analog_Output_Present_Value_Priority()` | なし | — |  |
+| `Property_List` | `Analog_Output_Property_Lists()` | なし | — | Property List 提供I/F |
 
 ---
 
 ## BI（Binary Input）
 
-| プロパティ | サーバ更新区分 | Getter | Setter | ライブラリ内部更新 | 備考 |
-|---|---|---|---|---|---|
-| `Present_Value` | 毎スキャン書込 | `Binary_Input_Present_Value()` | `Binary_Input_Present_Value_Set()` | なし | ② |
-| `Status_Flags` | 毎スキャン監視 | なし（合成値） | なし | あり（合成） | `Event_State`・`Out_Of_Service`・`Reliability` から動的合成 |
-| `Event_State` | 毎スキャン監視 | `Binary_Input_Event_State()` | なし（`INTRINSIC_REPORTING` 側が更新） | あり（`INTRINSIC_REPORTING` 有効時） | ① |
-| `Out_Of_Service` | 毎スキャン書込 | `Binary_Input_Out_Of_Service()` | `Binary_Input_Out_Of_Service_Set()` | なし | ② |
-| `Polarity` | 初回設定（WP更新あり） | `Binary_Input_Polarity()` | `Binary_Input_Polarity_Set()` | なし | — |
+| プロパティ | Getter I/F | Setter I/F | 区分 | 備考 |
+|---|---|---|---|---|
+| `Object_Identifier` | なし（インスタンス参照系のみ: `Binary_Input_Index_To_Instance()` など） | なし（インスタンス生成時に設定） | — | Property Getter/Setter は未提供 |
+| `Object_Name` | `Binary_Input_Object_Name()` / `Binary_Input_Name_ASCII()` | `Binary_Input_Name_Set()` | A |  |
+| `Object_Type` | なし | なし | — | 固定値を ReadProperty で返す |
+| `Present_Value` | `Binary_Input_Present_Value()` | `Binary_Input_Present_Value_Set()` | F | COV検出により `Change_Of_Value` を更新 |
+| `Description` | `Binary_Input_Description()` | `Binary_Input_Description_Set()` | A |  |
+| `Status_Flags` | なし（合成値） | なし | — | ReadProperty 内で構成要素から合成 |
+| `Event_State` | `Binary_Input_Event_State()` | なし | — | Setter は未提供 |
+| `Reliability` | `Binary_Input_Reliability()` | `Binary_Input_Reliability_Set()` | F | fault 状態変化時に `Change_Of_Value` を更新 |
+| `Out_Of_Service` | `Binary_Input_Out_Of_Service()` | `Binary_Input_Out_Of_Service_Set()` | F | COV検出により `Change_Of_Value` を更新 |
+| `Polarity` | `Binary_Input_Polarity()` | `Binary_Input_Polarity_Set()` | A |  |
+| `Active_Text` | `Binary_Input_Active_Text()` | `Binary_Input_Active_Text_Set()` | A |  |
+| `Inactive_Text` | `Binary_Input_Inactive_Text()` | `Binary_Input_Inactive_Text_Set()` | A |  |
+| `Property_List` | `Binary_Input_Property_Lists()` | なし | — | Property List 提供I/F |
 
 ---
 
 ## BO（Binary Output）
 
-| プロパティ | サーバ更新区分 | Getter | Setter | ライブラリ内部更新 | 備考 |
-|---|---|---|---|---|---|
-| `Present_Value` | 毎スキャン書込 | `Binary_Output_Present_Value()` | `Binary_Output_Present_Value_Set()` | なし | ② |
-| `Status_Flags` | 毎スキャン監視 | なし（合成値） | なし | あり（合成） | `Out_Of_Service`・`Reliability` から動的合成（`IN_ALARM` は常に false） |
-| `Event_State` | ライブラリ固定 | なし | なし | なし | `bo.c` の ReadProperty で `EVENT_STATE_NORMAL` にハードコード |
-| `Out_Of_Service` | 毎スキャン書込 | `Binary_Output_Out_Of_Service()` | `Binary_Output_Out_Of_Service_Set()` | なし | ② |
-| `Polarity` | 初回設定（WP更新あり） | `Binary_Output_Polarity()` | `Binary_Output_Polarity_Set()` | なし | — |
-| `Relinquish_Default` | 初回設定（WP更新あり） | `Binary_Output_Relinquish_Default()` | `Binary_Output_Relinquish_Default_Set()` | なし | — |
-| `Current_Command_Priority` | 毎スキャン監視 | `Binary_Output_Present_Value_Priority()` | なし（ライブラリが自動算出） | あり | ① AO と同様 |
+| プロパティ | Getter I/F | Setter I/F | 区分 | 備考 |
+|---|---|---|---|---|
+| `Object_Identifier` | なし（インスタンス参照系のみ: `Binary_Output_Index_To_Instance()` など） | なし（インスタンス生成時に設定） | — | Property Getter/Setter は未提供 |
+| `Object_Name` | `Binary_Output_Object_Name()` / `Binary_Output_Name_ASCII()` | `Binary_Output_Name_Set()` | A |  |
+| `Object_Type` | なし | なし | — | 固定値を ReadProperty で返す |
+| `Present_Value` | `Binary_Output_Present_Value()` | `Binary_Output_Present_Value_Set()` | B | Priority 指定付き Setter |
+| `Description` | `Binary_Output_Description()` | `Binary_Output_Description_Set()` | A |  |
+| `Status_Flags` | なし（合成値） | なし | — | ReadProperty 内で構成要素から合成 |
+| `Event_State` | なし | なし | — | ReadProperty で固定値返却 |
+| `Reliability` | `Binary_Output_Reliability()` | `Binary_Output_Reliability_Set()` | F | fault 状態変化時に `Changed` を更新 |
+| `Out_Of_Service` | `Binary_Output_Out_Of_Service()` | `Binary_Output_Out_Of_Service_Set()` | F | 値変化時に `Changed` を更新 |
+| `Polarity` | `Binary_Output_Polarity()` | `Binary_Output_Polarity_Set()` | A |  |
+| `Active_Text` | `Binary_Output_Active_Text()` | `Binary_Output_Active_Text_Set()` | A |  |
+| `Inactive_Text` | `Binary_Output_Inactive_Text()` | `Binary_Output_Inactive_Text_Set()` | A |  |
+| `Priority_Array` | `Binary_Output_Priority_Array_Value()` / `Binary_Output_Priority_Array_Relinquished()` | なし（直接Setterなし） | — | 要素参照I/Fのみ |
+| `Relinquish_Default` | `Binary_Output_Relinquish_Default()` | `Binary_Output_Relinquish_Default_Set()` | A |  |
+| `Current_Command_Priority` | `Binary_Output_Present_Value_Priority()` | なし | — |  |
+| `Property_List` | `Binary_Output_Property_Lists()` | なし | — | Property List 提供I/F |
 
 ---
 
 ## Device
 
-| プロパティ | サーバ更新区分 | Getter | Setter | ライブラリ内部更新 | 備考 |
-|---|---|---|---|---|---|
-| `System_Status` | 毎スキャン書込 | `Device_System_Status()` | `Device_Set_System_Status()` | なし | ② |
-| `Object_Name` | 初回設定（WP更新あり） | `Device_Object_Name()` | `Device_Set_Object_Name()` | WP受信時に `Device_Inc_Database_Revision()` を自動呼び出し | WP後に `Database_Revision` も連動更新される |
-| `APDU_Timeout` | 初回設定（WP更新あり） | `apdu_timeout()`（`h_apdu.h`） | `apdu_timeout_set()` | なし | — |
-| `Number_Of_APDU_Retries` | 初回設定（WP更新あり） | `apdu_retries()`（`h_apdu.h`） | `apdu_retries_set()` | なし | — |
-| `Database_Revision` | 毎スキャン監視 | `Device_Database_Revision()` | `Device_Set_Database_Revision()` / `Device_Inc_Database_Revision()` | あり | ① Object_Name変更・オブジェクト追加削除・WP受信時などに自動インクリメント |
+| プロパティ | Getter I/F | Setter I/F | 区分 | 備考 |
+|---|---|---|---|---|
+| `Object_Identifier` | `Device_Object_Instance_Number()` | `Device_Set_Object_Instance_Number()` | F | `Database_Revision` をインクリメント |
+| `Object_Name` | `Device_Object_Name()` / `Device_Object_Name_ANSI()` | `Device_Set_Object_Name()` | F | `Database_Revision` をインクリメント |
+| `Object_Type` | なし | なし | — | 固定値を ReadProperty で返す |
+| `System_Status` | `Device_System_Status()` | `Device_Set_System_Status()` | A |  |
+| `Vendor_Name` | `Device_Vendor_Name()` | `Device_Set_Vendor_Name()` | A |  |
+| `Vendor_Identifier` | `Device_Vendor_Identifier()` | `Device_Set_Vendor_Identifier()` | A |  |
+| `Model_Name` | `Device_Model_Name()` | `Device_Set_Model_Name()` | A |  |
+| `Firmware_Revision` | `Device_Firmware_Revision()` | `Device_Set_Firmware_Revision()` | A |  |
+| `Application_Software_Version` | `Device_Application_Software_Version()` | `Device_Set_Application_Software_Version()` | A |  |
+| `Protocol_Version` | `Device_Protocol_Version()` | なし | — |  |
+| `Protocol_Revision` | `Device_Protocol_Revision()` | なし | — |  |
+| `Protocol_Services_Supported` | なし（専用Getterなし） | なし | — | ReadProperty 内でエンコード |
+| `Protocol_Object_Types_Supported` | なし（専用Getterなし） | なし | — | ReadProperty 内でエンコード |
+| `Object_List` | `Device_Object_List_Count()` / `Device_Object_List_Identifier()` | なし | — | 一覧参照I/Fのみ |
+| `Max_APDU_Length_Accepted` | なし（専用Getterなし） | なし | — | APDU側定義値を ReadProperty で返す |
+| `Segmentation_Supported` | `Device_Segmentation_Supported()` | なし | — |  |
+| `APDU_Timeout` | `apdu_timeout()` | `apdu_timeout_set()` | A | `h_apdu.h` |
+| `Number_Of_APDU_Retries` | `apdu_retries()` | `apdu_retries_set()` | A | `h_apdu.h` |
+| `Device_Address_Binding` | なし（専用Getterなし） | なし | — | ReadProperty 内でアドレス情報を構成 |
+| `Database_Revision` | `Device_Database_Revision()` | `Device_Set_Database_Revision()` / `Device_Inc_Database_Revision()` | A |  |
+| `Property_List` | `Device_Property_Lists()` | なし | — | Property List 提供I/F |
 
 ---
 
@@ -1969,27 +2032,57 @@ bacnet-stack V1.4.2 の `src/bacnet/basic/object/` 以下を調査した結果�
 
 **共通プロパティ（BIP / MSTP 両方）**
 
-| プロパティ | サーバ更新区分 | Getter | Setter | ライブラリ内部更新 | 備考 |
-|---|---|---|---|---|---|
-| `Status_Flags` | 毎スキャン監視 | なし（合成値） | なし | あり（合成） | `Reliability`・`Out_Of_Service` から動的合成（`IN_ALARM` は常に false） |
-| `Changes_Pending` | 毎スキャン監視 | `Network_Port_Changes_Pending()` | `Network_Port_Changes_Pending_Set()` | あり | ① WP受信時にライブラリが自動で `true` にセット |
+| プロパティ | Getter I/F | Setter I/F | 区分 | 備考 |
+|---|---|---|---|---|
+| `Object_Identifier` | なし（インスタンス参照系: `Network_Port_Index_To_Instance()` など） | `Network_Port_Object_Instance_Number_Set()` | A |  |
+| `Object_Name` | `Network_Port_Object_Name()` / `Network_Port_Object_Name_ASCII()` | `Network_Port_Name_Set()` | A |  |
+| `Object_Type` | なし | なし | — | 固定値を ReadProperty で返す |
+| `Description` | `Network_Port_Description()` | `Network_Port_Description_Set()` | A |  |
+| `Status_Flags` | なし（合成値） | なし | — | ReadProperty 内で構成要素から合成 |
+| `Reliability` | `Network_Port_Reliability()` | `Network_Port_Reliability_Set()` | A |  |
+| `Out_Of_Service` | `Network_Port_Out_Of_Service()` | `Network_Port_Out_Of_Service_Set()` | A |  |
+| `Network_Type` | `Network_Port_Type()` | `Network_Port_Type_Set()` | A |  |
+| `Protocol_Level` | なし（専用Getterなし） | なし | — | ReadProperty で返却 |
+| `Changes_Pending` | `Network_Port_Changes_Pending()` | `Network_Port_Changes_Pending_Set()` | F | `false` 設定時は discard callback を起動し得る |
+| `Property_List` | `Network_Port_Property_Lists()` / `Network_Port_Property_List()` | なし | — | Property List 提供I/F |
 
 **BIP 固有プロパティ**
 
-| プロパティ | サーバ更新区分 | Getter | Setter | ライブラリ内部更新 | 備考 |
-|---|---|---|---|---|---|
-| `BBMD_Accept_FD_Registrations` | 初回設定（WP更新あり） | `Network_Port_BBMD_Accept_FD_Registrations()` | `Network_Port_BBMD_Accept_FD_Registrations_Set()` | なし | — |
-| `FD_BBMD_Address` | 初回設定（WP更新あり） | `Network_Port_Remote_BBMD_Address()` | `Network_Port_Remote_BBMD_Address_Set()` | なし | `BACNET_HOST_N_PORT` 型 |
-| `FD_Subscription_Lifetime` | 初回設定（WP更新あり） | `Network_Port_Remote_BBMD_BIP_Lifetime()` | `Network_Port_Remote_BBMD_BIP_Lifetime_Set()` | なし | — |
+| プロパティ | Getter I/F | Setter I/F | 区分 | 備考 |
+|---|---|---|---|---|
+| `Network_Number` | `Network_Port_Network_Number()` | `Network_Port_Network_Number_Set()` | A |  |
+| `Network_Number_Quality` | `Network_Port_Quality()` | `Network_Port_Quality_Set()` | A |  |
+| `APDU_Length` | `Network_Port_APDU_Length()` | `Network_Port_APDU_Length_Set()` | A |  |
+| `MAC_Address` | `Network_Port_MAC_Address()` / `Network_Port_MAC_Address_Value()` | `Network_Port_MAC_Address_Set()` | D | Property値は更新されるがBIP bind先IP/Portは不変 |
+| `BACnet_IP_Mode` | `Network_Port_BIP_Mode()` | `Network_Port_BIP_Mode_Set()` | E | `Changes_Pending=true` になるがBIP Activate側の適用処理は未確認 |
+| `BACnet_IP_UDP_Port` | `Network_Port_BIP_Port()` | `Network_Port_BIP_Port_Set()` | E | `Changes_Pending=true` になるがBIPソケット再bind処理は未確認 |
+| `BBMD_Broadcast_Distribution_Table` | `Network_Port_BBMD_BD_Table()` | `Network_Port_BBMD_BD_Table_Set()` | C | WP成功時に `Changes_Pending=true` |
+| `BBMD_Accept_FD_Registrations` | `Network_Port_BBMD_Accept_FD_Registrations()` | `Network_Port_BBMD_Accept_FD_Registrations_Set()` | C | WP成功時に `Changes_Pending=true` |
+| `BBMD_Foreign_Device_Table` | `Network_Port_BBMD_FD_Table()` | `Network_Port_BBMD_FD_Table_Set()` | C | WP成功時に `Changes_Pending=true` |
+| `FD_BBMD_Address` | `Network_Port_Remote_BBMD_Address()` | `Network_Port_Remote_BBMD_Address_Set()` | C | `BACNET_HOST_N_PORT` |
+| `FD_Subscription_Lifetime` | `Network_Port_Remote_BBMD_BIP_Lifetime()` | `Network_Port_Remote_BBMD_BIP_Lifetime_Set()` | C | WP成功時に `Changes_Pending=true` |
+| `IP_Address` | `Network_Port_IP_Address()` / `Network_Port_IP_Address_Get()` | `Network_Port_IP_Address_Set()` | D | Property値は更新されるがBIP bind先IPは不変 |
+| `IP_Subnet_Mask` | `Network_Port_IP_Subnet()` | 実装上は `Network_Port_IP_Subnet_Prefix_Set()` で間接変更 | E | `Network_Port_IP_Subnet_Get/Set()` は header 宣言のみで `.c` 実装なし。ReadProperty値は Prefix から算出 |
+| `IP_Default_Gateway` | `Network_Port_IP_Gateway()` / `Network_Port_IP_Gateway_Get()` | `Network_Port_IP_Gateway_Set()` | D | Property値は更新されるが通信スタック設定は自動変更されない |
+| `IP_DNS_Server` | `Network_Port_IP_DNS_Server()` / `Network_Port_IP_DNS_Server_Get()` | `Network_Port_IP_DNS_Server_Set()` | E | インデックス指定。`Changes_Pending=true` になるが通信設定適用は未確認 |
+| `IP_DHCP_Enable` | `Network_Port_IP_DHCP_Enable()` | `Network_Port_IP_DHCP_Enable_Set()` | E | `Changes_Pending=true` になるがDHCP設定反映処理は未確認 |
+| `IP_DHCP_Lease_Time` | `Network_Port_IP_DHCP_Lease_Time()` | `Network_Port_IP_DHCP_Lease_Time_Set()` | E | `Changes_Pending=true` と開始時刻更新を伴うが通信設定反映は未確認 |
+| `IP_DHCP_Lease_Time_Remaining` | `Network_Port_IP_DHCP_Lease_Time_Remaining()` | なし | — |  |
+| `IP_DHCP_Server` | `Network_Port_IP_DHCP_Server()` | `Network_Port_IP_DHCP_Server_Set()` | E | `Changes_Pending=true` になるがDHCP設定反映処理は未確認 |
+| `Link_Speed` | `Network_Port_Link_Speed()` | `Network_Port_Link_Speed_Set()` | E | `Changes_Pending=true` になるがBIP通信実体への適用は未確認 |
 
 **MSTP 固有プロパティ**
 
-| プロパティ | サーバ更新区分 | Getter | Setter | ライブラリ内部更新 | 備考 |
-|---|---|---|---|---|---|
-| `MAC_Address` | 初回設定（WP更新あり） | `Network_Port_MSTP_MAC_Address()` | `Network_Port_MSTP_MAC_Address_Set()` | なし | `uint8_t`、範囲 0〜127 |
-| `Link_Speed` | 初回設定（WP更新あり） | `Network_Port_Link_Speed()` | `Network_Port_Link_Speed_Set()` | なし | — |
-| `Max_Manager` | 初回設定（WP更新あり） | `Network_Port_MSTP_Max_Master()` | `Network_Port_MSTP_Max_Master_Set()` | なし | — |
-| `Max_Info_Frames` | 初回設定（WP更新あり） | `Network_Port_MSTP_Max_Info_Frames()` | `Network_Port_MSTP_Max_Info_Frames_Set()` | なし | — |
+| プロパティ | Getter I/F | Setter I/F | 区分 | 備考 |
+|---|---|---|---|---|
+| `Network_Number` | `Network_Port_Network_Number()` | `Network_Port_Network_Number_Set()` | A |  |
+| `Network_Number_Quality` | `Network_Port_Quality()` | `Network_Port_Quality_Set()` | A |  |
+| `APDU_Length` | `Network_Port_APDU_Length()` | `Network_Port_APDU_Length_Set()` | A |  |
+| `MAC_Address` | `Network_Port_MSTP_MAC_Address()` | `Network_Port_MSTP_MAC_Address_Set()` | C | WP成功時に `Changes_Pending=true` |
+| `Link_Speed` | `Network_Port_Link_Speed()` | `Network_Port_Link_Speed_Set()` | C | WP成功時に `Changes_Pending=true` |
+| `Link_Speeds` | なし（専用Getterなし） | なし | — | ReadProperty で対応速度配列を返却 |
+| `Max_Manager` | `Network_Port_MSTP_Max_Master()` | `Network_Port_MSTP_Max_Master_Set()` | C | WP成功時に `Changes_Pending=true` |
+| `Max_Info_Frames` | `Network_Port_MSTP_Max_Info_Frames()` | `Network_Port_MSTP_Max_Info_Frames_Set()` | C | WP成功時に `Changes_Pending=true` |
 
 ---
 
